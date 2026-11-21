@@ -49,8 +49,8 @@ fn fill_defaults(
         .map(PathBuf::from)
         .or_else(|| env::home_dir().map(|home| home.join(".claude")))
         .ok_or("cannot locate Claude Code settings.json")?;
-    let bytes = fs::read(dir.join("settings.json"))
-        .map_err(|_| "cannot read Claude Code settings.json")?;
+    let bytes =
+        fs::read(dir.join("settings.json")).map_err(|_| "cannot read Claude Code settings.json")?;
     let ClaudeSettings { env: gateway } = serde_json::from_slice(&bytes)
         .map_err(|_| "invalid Claude Code settings.json or missing gateway URL/Token")?;
     if gateway.token.contains(['\r', '\n']) {
@@ -81,8 +81,5 @@ fn optional_client<T>(name: &str, client: Result<T, ModelError>) -> Option<Arc<T
 }
 
 fn warn(reason: impl Display) {
-    let _ = writeln!(
-        io::stderr().lock(),
-        "model defaults unavailable: {reason}"
-    );
+    let _ = writeln!(io::stderr().lock(), "model defaults unavailable: {reason}");
 }
