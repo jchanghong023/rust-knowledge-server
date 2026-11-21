@@ -23,39 +23,12 @@ pub(crate) fn query_name(query: &str) -> Option<String> {
 /// Returns complete names in first-occurrence order, deduplicated by folded spelling.
 /// Scan only the section; check both ends of each candidate against the original document.
 pub(crate) fn section_names(document: &str, span: Range<usize>) -> Vec<String> {
-    let Some(section) = document.get(span.clone()) else {
-        return Vec::new();
-    };
     let mut names = HashMap::new();
-    let mut chars = section.char_indices().peekable();
-    while let Some((offset, ch)) = chars.next() {
-        if !name_character(ch) {
-            continue;
-        }
-        while chars.next_if(|&(_, next)| name_character(next)).is_some() {}
-        let start = span.start + offset;
-        let end = chars
-            .peek()
-            .map_or(span.end, |&(offset, _)| span.start + offset);
-        if document[..start]
-            .chars()
-            .next_back()
-            .is_some_and(name_character)
-        {
-            continue;
-        }
-        let complete =
-            end < span.end || !document[end..].chars().next().is_some_and(name_character);
-        for candidate_end in [prose_end(document, start, end), complete.then_some(end)]
-            .into_iter()
-            .flatten()
-        {
-            let candidate = &document[start..candidate_end];
-            if literal_spelling(candidate) {
-                let ordinal = names.len();
-                names.entry(canonical(candidate)).or_insert(ordinal);
-            }
-        }
+    for spelling in spellings(document, span) {
+        let ordinal = names.len();
+        names
+            .entry(canonical(&document[spelling]))
+            .or_insert(ordinal);
     }
     // Moving the keys into their slots preserves order without cloning any names.
     let mut ordered = vec![String::new(); names.len()];
@@ -63,6 +36,64 @@ pub(crate) fn section_names(document: &str, span: Range<usize>) -> Vec<String> {
         ordered[ordinal] = name.into_owned();
     }
     ordered
+}
+
+pub(crate) fn name_span(text: &str, folded: &str) -> Option<Range<usize>> {
+    let mut at_boundary = None;
+    for span in spellings(text, 0..text.len()) {
+        let spelling = &text[span.clone()];
+        let matches = if spelling.is_ascii() {
+            spelling.eq_ignore_ascii_case(folded)
+        } else {
+            spelling.chars().default_case_fold().eq(folded.chars())
+        };
+        if matches {
+            if span.start != 0 && span.end + 1 < text.len() {
+                return Some(span);
+            }
+            at_boundary.get_or_insert(span);
+        }
+    }
+    at_boundary
+}
+
+fn spellings(document: &str, span: Range<usize>) -> impl Iterator<Item = Range<usize>> + '_ {
+    let mut chars = document
+        .get(span.clone())
+        .unwrap_or("")
+        .char_indices()
+        .peekable();
+    std::iter::from_fn(move || {
+        while let Some((offset, ch)) = chars.next() {
+            if !name_character(ch) {
+                continue;
+            }
+            while chars.next_if(|&(_, next)| name_character(next)).is_some() {}
+            let start = span.start + offset;
+            let end = chars
+                .peek()
+                .map_or(span.end, |&(offset, _)| span.start + offset);
+            if document[..start]
+                .chars()
+                .next_back()
+                .is_some_and(name_character)
+            {
+                continue;
+            }
+            let complete =
+                end < span.end || !document[end..].chars().next().is_some_and(name_character);
+            return Some(
+                [prose_end(document, start, end), complete.then_some(end)]
+                    .into_iter()
+                    .flatten()
+                    .filter_map(move |end| {
+                        literal_spelling(&document[start..end]).then_some(start..end)
+                    }),
+            );
+        }
+        None
+    })
+    .flatten()
 }
 
 fn canonical(spelling: &str) -> Cow<'_, str> {

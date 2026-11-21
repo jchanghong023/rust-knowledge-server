@@ -140,19 +140,31 @@ impl Drop for Build {
 pub(crate) struct Version {
     shard: Option<Shard>,
     id: Uuid,
+    library: String,
+    library_id: Uuid,
     retired: AtomicBool,
     // A retained snapshot must also keep the exclusive root lock alive.
     _root: Arc<Root>,
 }
 
 impl Version {
-    fn new(root: Arc<Root>, id: Uuid, path: PathBuf) -> Self {
+    fn new(root: Arc<Root>, id: Uuid, library: &str, library_id: Uuid, path: PathBuf) -> Self {
         Self {
             shard: Some(Shard::published(path)),
             id,
+            library: library.to_owned(),
+            library_id,
             retired: AtomicBool::new(false),
             _root: root,
         }
+    }
+
+    pub(crate) fn identity(&self) -> (Uuid, Uuid) {
+        (self.library_id, self.id)
+    }
+
+    pub(crate) fn library(&self) -> &str {
+        &self.library
     }
 
     #[cfg(test)]
@@ -260,11 +272,19 @@ impl Catalog {
                 .and_then(canonical_uuid)
                 .is_some()
         })?;
-        let versions = referenced
-            .into_iter()
-            .map(|id| {
-                let version = Version::new(Arc::clone(&root), id, id_path(&versions_root, id));
-                (id, Arc::new(version))
+        let versions = table
+            .libraries
+            .iter()
+            .filter_map(|(name, entry)| {
+                let id = entry.version_id?;
+                let version = Version::new(
+                    Arc::clone(&root),
+                    id,
+                    name,
+                    entry.id,
+                    id_path(&versions_root, id),
+                );
+                Some((id, Arc::new(version)))
             })
             .collect();
         Ok(Self {
@@ -422,6 +442,8 @@ impl Catalog {
             Arc::new(Version::new(
                 Arc::clone(&self.root),
                 build.version_id,
+                &build.name,
+                build.base.id,
                 std::mem::take(&mut build.path),
             )),
         );
@@ -445,6 +467,19 @@ impl Catalog {
             return Ok(pin(entry).into_iter().collect());
         }
         Ok(state.table.libraries.iter().filter_map(pin).collect())
+    }
+
+    pub(crate) fn pin_version(
+        &self,
+        library_id: Uuid,
+        version_id: Uuid,
+    ) -> Result<Option<Arc<Version>>, CatalogError> {
+        let state = self.lock()?;
+        Ok(state
+            .versions
+            .get(&version_id)
+            .filter(|version| version.library_id == library_id)
+            .cloned())
     }
 
     pub(crate) fn receipt(&self, operation: Uuid) -> Result<Option<Receipt>, CatalogError> {

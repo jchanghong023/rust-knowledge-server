@@ -283,7 +283,11 @@ async fn scoped_bm25_rank_is_unaffected_by_outside_document_frequency_and_budget
     let after = search(&fixture.catalog, query(), None, None, FusionMode::Grouped)
         .await
         .unwrap();
-    assert_eq!(after.matches, before.matches);
+    // Reimport assigns new internal point and version IDs, not new evidence.
+    assert_eq!(
+        serde_json::to_value(&after.matches).unwrap(),
+        serde_json::to_value(&before.matches).unwrap()
+    );
 }
 
 #[derive(Default)]

@@ -104,7 +104,7 @@ fn tab_fence_end(block: &str) -> Option<usize> {
     None
 }
 
-fn source_lines(mut rest: &str) -> impl Iterator<Item = &str> {
+pub(crate) fn source_lines(mut rest: &str) -> impl Iterator<Item = &str> {
     std::iter::from_fn(move || {
         if rest.is_empty() {
             return None;

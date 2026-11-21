@@ -13,8 +13,10 @@ use qdrant_edge::{
     RetrieveRequest, ScoringQuery, ScrollRequest, SearchParams, ValueVariants, VectorInternal,
     WithPayloadInterface,
 };
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use uuid::Uuid;
 
 use crate::{
     catalog::{Catalog, CatalogError, Snapshot},
@@ -82,7 +84,7 @@ pub(crate) struct Scope {
     pub(crate) path: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Status {
     Ok,
@@ -96,7 +98,7 @@ pub(crate) enum Retrieval {
     Hybrid,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Category {
     Exact,
@@ -112,6 +114,16 @@ pub(crate) struct Evidence {
     pub(crate) line_end: usize,
     pub(crate) sha256: String,
     pub(crate) category: Category,
+    #[serde(skip)]
+    pub(crate) source: Source,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Source {
+    pub(crate) library: Uuid,
+    pub(crate) version: Uuid,
+    pub(crate) point: u64,
+    pub(crate) byte_start: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -121,6 +133,8 @@ pub(crate) struct SearchReply {
     pub(crate) matches: Vec<Evidence>,
     pub(crate) retrieval: Retrieval,
     pub(crate) reranked: bool,
+    #[serde(skip)]
+    pub(crate) name: Option<String>,
 }
 
 pub(crate) async fn search(
@@ -172,6 +186,7 @@ pub(crate) async fn search(
             matches: Vec::new(),
             retrieval: Retrieval::Keyword,
             reranked: false,
+            name: None,
         });
     }
     let filter = scope
@@ -216,9 +231,10 @@ pub(crate) async fn search(
     };
     // The runtime bounds its blocking pool. Keep each batch of Edge work together
     // rather than scheduling a worker per library or per retrieval branch.
-    let (query, mut matches) = tokio::task::spawn_blocking(move || {
-        let matches = retrieve(&snapshot, &query, filter, semantic, fusion)?;
-        Ok::<_, SearchError>((query, matches))
+    let (query, name, mut matches) = tokio::task::spawn_blocking(move || {
+        let name = query_name(&query);
+        let matches = retrieve(&snapshot, &query, name.as_deref(), filter, semantic, fusion)?;
+        Ok::<_, SearchError>((query, name, matches))
     })
     .await
     .map_err(|_| SearchError::Store)??;
@@ -245,6 +261,7 @@ pub(crate) async fn search(
         matches,
         retrieval,
         reranked,
+        name,
     })
 }
 
@@ -348,13 +365,12 @@ fn category<'a>(mut names: impl Iterator<Item = &'a str>, query: Option<&str>) -
 fn retrieve(
     snapshot: &Snapshot,
     query: &str,
+    name: Option<&str>,
     filter: Option<Filter>,
     semantic: Option<(Vec<usize>, Vec<f32>)>,
     fusion: FusionMode,
 ) -> Result<Vec<Evidence>, SearchError> {
-    let name = query_name(query);
     let exact_filter = name
-        .as_ref()
         .map(|name| {
             let mut filter = filter.clone().unwrap_or_default();
             filter
@@ -426,8 +442,7 @@ fn retrieve(
                 let PointId::NumId(id) = point.id else {
                     return Err(SearchError::Store);
                 };
-                let candidate =
-                    Candidate::from_payload(library, id, point.payload, name.as_deref())?;
+                let candidate = Candidate::from_payload(library, id, point.payload, name)?;
                 if candidate.category != Category::Exact {
                     return Err(SearchError::Store);
                 }
@@ -467,8 +482,7 @@ fn retrieve(
                 if !point.score.is_finite() {
                     return Err(SearchError::Store);
                 }
-                let mut candidate =
-                    Candidate::from_payload(library, id, point.payload, name.as_deref())?;
+                let mut candidate = Candidate::from_payload(library, id, point.payload, name)?;
                 candidate.rank_score = f64::from(point.score);
                 local.insert(id, candidate);
             }
@@ -502,12 +516,9 @@ fn retrieve(
                     };
                     let candidate = match local.entry(id) {
                         Entry::Occupied(entry) => entry.into_mut(),
-                        Entry::Vacant(entry) => entry.insert(Candidate::from_payload(
-                            library,
-                            id,
-                            point.payload,
-                            name.as_deref(),
-                        )?),
+                        Entry::Vacant(entry) => {
+                            entry.insert(Candidate::from_payload(library, id, point.payload, name)?)
+                        }
                     };
                     candidate.rank_score += 1.0 / (RRF_K + rank) as f64;
                 }
@@ -524,7 +535,7 @@ fn retrieve(
         // Later shards cannot add a vote to points from this shard.
         best.truncate(RESULT_LIMIT);
     }
-    load_evidence(snapshot, &best, name.as_deref())
+    load_evidence(snapshot, &best, name)
 }
 
 fn location_order(left: &Candidate, right: &Candidate) -> Ordering {
@@ -564,6 +575,7 @@ fn load_evidence(
             {
                 return Err(SearchError::Store);
             }
+            let (library_id, version_id) = version.identity();
             evidence[rank] = Some(Evidence {
                 text: passage.text,
                 library: library.clone(),
@@ -572,6 +584,12 @@ fn load_evidence(
                 line_end: passage.line_end,
                 sha256: passage.sha256,
                 category: candidate.category,
+                source: Source {
+                    library: library_id,
+                    version: version_id,
+                    point: candidate.id,
+                    byte_start: passage.byte_start,
+                },
             });
         }
     }

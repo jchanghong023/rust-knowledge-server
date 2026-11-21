@@ -231,12 +231,12 @@ impl Service {
     }
 
     async fn publish_fixture(&self, cookie: &str) {
-        let accepted = body(
-            self.upload(cookie, &[(SOURCE_PATH, SOURCE.as_bytes())])
-                .await,
-            StatusCode::ACCEPTED,
-        )
-        .await;
+        self.publish(cookie, &[(SOURCE_PATH, SOURCE.as_bytes())])
+            .await;
+    }
+
+    async fn publish(&self, cookie: &str, files: &[(&str, &[u8])]) {
+        let accepted = body(self.upload(cookie, files).await, StatusCode::ACCEPTED).await;
         let id = accepted["id"].as_str().expect("import operation ID");
         time::timeout(DEADLINE, async {
             loop {
@@ -409,19 +409,28 @@ impl<'a> Mcp<'a> {
     }
 
     async fn search(&mut self, arguments: &Value) -> Value {
-        let reply = self.tool("knowledge_search", arguments).await;
-        assert!(reply.get("error").is_none(), "{reply}");
-        let result = &reply["result"];
-        assert_ne!(result["isError"], true, "{reply}");
-        assert!(result["structuredContent"].is_object(), "{reply}");
-        let text = result["content"].as_array().unwrap();
-        assert!(
-            text.iter().any(|item| item["type"] == "text"
-                && item["text"].as_str().is_some_and(|s| !s.is_empty())),
-            "{reply}"
-        );
-        result["structuredContent"].clone()
+        successful_tool(self.tool("knowledge_search", arguments).await)
     }
+
+    async fn fetch(&mut self, reference: &Value) -> Value {
+        self.tool("knowledge_fetch", &json!({"ref": reference}))
+            .await
+    }
+}
+
+fn successful_tool(reply: Value) -> Value {
+    assert!(reply.get("error").is_none(), "{reply}");
+    let result = &reply["result"];
+    assert_ne!(result["isError"], true, "{reply}");
+    let structured = &result["structuredContent"];
+    assert!(structured.is_object(), "{reply}");
+    let text = result["content"][0]["text"].as_str().unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(text).unwrap(),
+        *structured,
+        "{reply}"
+    );
+    structured.clone()
 }
 
 async fn mcp_reply(mut response: Response, id: u64) -> Value {
@@ -496,6 +505,22 @@ fn assert_fixture_evidence(reply: &Value) {
     );
 }
 
+fn assert_mcp_fixture(reply: &Value) {
+    let hit = &reply["matches"][0];
+    assert!(hit["ref"].as_str().is_some_and(|value| !value.is_empty()));
+    assert_eq!(
+        reply,
+        &json!({
+            "status": "ok",
+            "matches": [{
+                "text": SOURCE, "library": LIBRARY, "path": SOURCE_PATH,
+                "line_start": 1, "line_end": 5, "category": "exact",
+                "ref": hit["ref"], "truncated": false
+            }]
+        })
+    );
+}
+
 #[tokio::test]
 async fn native_mcp_and_web_agree_on_evidence_empty_states_and_missing_segments() {
     let root = tempfile::tempdir().unwrap();
@@ -511,9 +536,42 @@ async fn native_mcp_and_web_agree_on_evidence_empty_states_and_missing_segments(
     let mut mcp = Mcp::connect(&service).await;
     let listed = mcp.rpc("tools/list", json!({})).await;
     let tools = listed["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 1, "{listed}");
-    assert_eq!(tools[0]["name"], "knowledge_search");
-    assert_eq!(tools[0]["annotations"]["readOnlyHint"], true);
+    assert_eq!(tools.len(), 2, "{listed}");
+    let find = |name| tools.iter().find(|tool| tool["name"] == name).unwrap();
+    let search = find("knowledge_search");
+    let fetch = find("knowledge_fetch");
+    for tool in [search, fetch] {
+        assert_eq!(tool["annotations"]["readOnlyHint"], true);
+        assert_eq!(tool["annotations"]["destructiveHint"], false);
+    }
+    assert_eq!(search["inputSchema"]["required"], json!(["query"]));
+    assert_eq!(
+        search["outputSchema"]["properties"]["matches"]["maxItems"],
+        5
+    );
+    assert_eq!(fetch["inputSchema"]["required"], json!(["ref"]));
+    assert_eq!(fetch["inputSchema"]["additionalProperties"], false);
+    let required = fetch["outputSchema"]["required"].as_array().unwrap();
+    for field in [
+        "text",
+        "library",
+        "path",
+        "line_start",
+        "line_end",
+        "truncated",
+    ] {
+        assert!(required.contains(&json!(field)));
+    }
+    let unknown = mcp
+        .tool("knowledge_search", &json!({"query": "vector", "limit": 3}))
+        .await;
+    assert_eq!(unknown["result"]["isError"], true, "{unknown}");
+    assert!(
+        unknown["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("unknown field `limit`")
+    );
     let write = mcp
         .tool("knowledge_create", &json!({"name": "from-mcp"}))
         .await;
@@ -537,7 +595,10 @@ async fn native_mcp_and_web_agree_on_evidence_empty_states_and_missing_segments(
     let no_index = service.web_search(&cookie, &query, StatusCode::OK).await;
     assert_eq!(no_index["status"], "no_published_index");
     assert_eq!(no_index["matches"], json!([]));
-    assert_eq!(mcp.search(&query).await, no_index);
+    assert_eq!(
+        mcp.search(&query).await,
+        json!({"status": "no_published_index", "matches": []})
+    );
 
     for (invalid, status, code, reason) in [
         (
@@ -578,7 +639,23 @@ async fn native_mcp_and_web_agree_on_evidence_empty_states_and_missing_segments(
     assert_fixture_evidence(&web);
     assert_eq!(web["reranked"], false);
     let audit = service.audit_records();
-    assert_eq!(mcp.search(&query).await, web);
+    let found = mcp.search(&query).await;
+    assert_mcp_fixture(&found);
+    let reference = &found["matches"][0]["ref"];
+    let fetch = successful_tool(mcp.fetch(reference).await);
+    assert_eq!(
+        fetch,
+        json!({
+            "text": SOURCE, "library": LIBRARY, "path": SOURCE_PATH,
+            "line_start": 1, "line_end": 5, "truncated": false
+        })
+    );
+    let invalid = mcp.fetch(&json!("../not-a-reference")).await;
+    assert_eq!(
+        invalid["error"]["data"]["error"], "invalid_input",
+        "{invalid}"
+    );
+    assert_mcp_fixture(&mcp.search(&json!({"query": "std::vector"})).await);
     assert_eq!(
         service.audit_records(),
         audit,
@@ -591,7 +668,10 @@ async fn native_mcp_and_web_agree_on_evidence_empty_states_and_missing_segments(
         .await;
     assert_eq!(zero["status"], "ok");
     assert_eq!(zero["matches"], json!([]));
-    assert_eq!(mcp.search(&unmatched).await, zero);
+    assert_eq!(
+        mcp.search(&unmatched).await,
+        json!({"status": "ok", "matches": []})
+    );
 
     let index = service.index_path();
     let persisted_audit = service.audit_records();
@@ -629,8 +709,191 @@ async fn native_mcp_and_web_agree_on_evidence_empty_states_and_missing_segments(
         result["structuredContent"].get("matches").is_none(),
         "{rpc}"
     );
+    let rpc = mcp.fetch(reference).await;
+    assert_eq!(rpc["result"]["isError"], true, "{rpc}");
+    assert_eq!(
+        rpc["result"]["structuredContent"]["error"], "storage",
+        "{rpc}"
+    );
     assert!(fs::read_dir(segments).unwrap().next().is_none());
     assert_eq!(fs::read(config).unwrap(), original_config);
+    service.stop().await;
+}
+
+#[tokio::test]
+async fn mcp_search_keeps_distinct_sources_and_complete_names_within_budget() {
+    let root = tempfile::tempdir().unwrap();
+    let service = Service::start(root.path(), None, None, FusionMode::Grouped).await;
+    let cookie = service.login(EMPLOYEE).await;
+    service.create(&cookie).await;
+    // The name is in both overlapping windows of an oversized physical line.
+    let wide = format!(
+        "opening\r\n{} std::vector {}\r\n",
+        "界".repeat(17_750),
+        "字".repeat(3_000)
+    );
+    let standard = format!(
+        "# Title\r\nbefore\r\n{}\r\nstd::vector value;\r\nafter\r\n",
+        "项".repeat(1500)
+    );
+    let paths = ["wide.md", "a.md", "b.md", "c.md", "d.md", "e.md", "f.md"];
+    let files = paths.map(|path| {
+        (
+            path,
+            if path == "wide.md" {
+                wide.as_bytes()
+            } else {
+                standard.as_bytes()
+            },
+        )
+    });
+    service.publish(&cookie, &files).await;
+    let mut mcp = Mcp::connect(&service).await;
+    let scoped = json!({"query": "std::vector", "path": "wide.md"});
+    let web = service.web_search(&cookie, &scoped, StatusCode::OK).await;
+    assert_eq!(web["matches"].as_array().unwrap().len(), 2);
+    let response = mcp.search(&scoped).await;
+    let hits = response["matches"].as_array().unwrap();
+    assert_eq!(hits.len(), 1, "{response}");
+    let hit = &hits[0];
+    assert_eq!(hit["category"], "exact");
+    assert_eq!(hit["truncated"], true);
+    assert_eq!(hit["line_start"], 2);
+    assert_eq!(hit["line_end"], 2);
+    let excerpt = hit["text"].as_str().unwrap();
+    assert!(excerpt.contains("std::vector") && wide.contains(excerpt));
+
+    let query = json!({"query": "std::vector", "library": LIBRARY});
+    let web = service.web_search(&cookie, &query, StatusCode::OK).await;
+    let response = mcp.search(&query).await;
+    let hits = response["matches"].as_array().unwrap();
+    assert_eq!(hits.len(), 5, "{response}");
+    assert!(
+        hits.iter()
+            .map(|hit| hit["text"].as_str().unwrap().len())
+            .sum::<usize>()
+            <= 4096
+    );
+    let mut ranked = web["matches"].as_array().unwrap().iter();
+    let mut distinct = std::collections::BTreeSet::new();
+    for hit in hits {
+        let path = hit["path"].as_str().unwrap();
+        assert!(distinct.insert(path));
+        let text = hit["text"].as_str().unwrap();
+        assert!(text.contains("std::vector"));
+        assert!(
+            ranked.any(|web_hit| {
+                web_hit["path"] == path && web_hit["text"].as_str().unwrap().contains(text)
+            }),
+            "{path} not in shared rank order"
+        );
+        if path != "wide.md" {
+            let offset = standard.find(text).unwrap();
+            let line_start = standard[..offset]
+                .bytes()
+                .filter(|&byte| byte == b'\n')
+                .count()
+                + 1;
+            let line_end = line_start
+                + text
+                    .trim_end_matches('\n')
+                    .bytes()
+                    .filter(|&byte| byte == b'\n')
+                    .count();
+            assert_eq!(hit["line_start"], line_start);
+            assert_eq!(hit["line_end"], line_end);
+        }
+    }
+    service.stop().await;
+}
+
+#[tokio::test]
+async fn mcp_fetch_reopens_existing_fragments_and_rejects_retired_refs() {
+    let root = tempfile::tempdir().unwrap();
+    let service = Service::start(root.path(), None, None, FusionMode::Grouped).await;
+    let cookie = service.login(EMPLOYEE).await;
+    service.create(&cookie).await;
+    let wide = format!(
+        "# Context\r\n{} left_marker std::vector {} right_marker {}\r\n# End\r\n",
+        "界".repeat(17_460),
+        "字".repeat(590),
+        "文".repeat(1_500)
+    );
+    let lines = (1..=83)
+        .map(|line| {
+            if line == 40 {
+                "# std::vector\r\n".to_owned()
+            } else {
+                format!("# line {line}\r\n")
+            }
+        })
+        .collect::<String>();
+    let files = [
+        ("overlap.md", wide.as_bytes()),
+        ("lines.md", lines.as_bytes()),
+        ("other.md", b"not this file"),
+    ];
+    service.publish(&cookie, &files).await;
+    let mut mcp = Mcp::connect(&service).await;
+    let query = json!({"query": "std::vector", "path": "overlap.md"});
+    let hit = mcp.search(&query).await;
+    let wide_ref = &hit["matches"][0]["ref"];
+    let hit = mcp
+        .search(&json!({"query": "std::vector", "path": "lines.md"}))
+        .await;
+    let lines_ref = &hit["matches"][0]["ref"];
+    service.stop().await;
+
+    let service = Service::start(root.path(), None, None, FusionMode::Grouped).await;
+    let mut mcp = Mcp::connect(&service).await;
+    let context = successful_tool(mcp.fetch(wide_ref).await);
+    let text = context["text"].as_str().unwrap();
+    assert!((4093..=4096).contains(&text.len()));
+    assert!(text.contains("left_marker") && text.contains("right_marker") && wide.contains(text));
+    assert_eq!(context["path"], "overlap.md");
+    assert_eq!(context["line_start"], 2);
+    assert_eq!(context["line_end"], 2);
+    assert_eq!(context["truncated"], true);
+    let context = successful_tool(mcp.fetch(lines_ref).await);
+    let start = context["line_start"].as_u64().unwrap() as usize;
+    let end = context["line_end"].as_u64().unwrap() as usize;
+    assert_eq!(end - start + 1, 60);
+    assert!((start..=end).contains(&40));
+    assert_eq!(
+        context["text"],
+        lines
+            .split_inclusive('\n')
+            .skip(start - 1)
+            .take(60)
+            .collect::<String>()
+    );
+    assert_eq!(context["path"], "lines.md");
+    assert_eq!(context["truncated"], true);
+
+    let cookie = service.login(EMPLOYEE).await;
+    service.publish(&cookie, &files).await; // Same content, different published generation.
+    let stale = mcp.fetch(wide_ref).await;
+    assert_eq!(stale["result"]["isError"], true);
+    assert_eq!(
+        stale["result"]["structuredContent"]["error"], "stale_ref",
+        "{stale}"
+    );
+    let found = mcp.search(&query).await;
+    let active_ref = &found["matches"][0]["ref"];
+    assert_ne!(active_ref, wide_ref);
+    let deleted = send(
+        service
+            .web(Method::DELETE, "/api/library", Some(&cookie))
+            .query(&[("name", LIBRARY)]),
+    )
+    .await;
+    assert_status(&deleted, StatusCode::NO_CONTENT);
+    let stale = mcp.fetch(active_ref).await;
+    assert_eq!(stale["result"]["isError"], true);
+    assert_eq!(
+        stale["result"]["structuredContent"]["error"], "stale_ref",
+        "{stale}"
+    );
     service.stop().await;
 }
 
@@ -867,15 +1130,17 @@ async fn equivalent_requests_report_their_own_rerank_success_or_degradation() {
     let mut mcp = Mcp::connect(&service).await;
     let query = fixture_query();
     let fallback = service.web_search(&cookie, &query, StatusCode::OK).await;
-    let reranked = mcp.search(&query).await;
-    assert_fixture_evidence(&fallback);
-    assert_fixture_evidence(&reranked);
-    assert_eq!(fallback["reranked"], false);
-    assert_eq!(reranked["reranked"], true);
+    let found = mcp.search(&query).await;
+    assert_mcp_fixture(&found);
     assert_eq!(
-        service.web_search(&cookie, &query, StatusCode::OK).await,
-        reranked
+        successful_tool(mcp.fetch(&found["matches"][0]["ref"]).await)["text"],
+        SOURCE
     );
+    assert_fixture_evidence(&fallback);
+    assert_eq!(fallback["reranked"], false);
+    let reranked = service.web_search(&cookie, &query, StatusCode::OK).await;
+    assert_fixture_evidence(&reranked);
+    assert_eq!(reranked["reranked"], true);
     let expected =
         json!({"model": "fixture-rerank", "query": "std::vector", "documents": [SOURCE]});
     assert_eq!(
@@ -934,7 +1199,12 @@ async fn web_and_mcp_report_embedding_fallback_and_reopen_without_optional_metad
     assert_fixture_evidence(&fallback);
     let mut hybrid = fallback.clone();
     hybrid["retrieval"] = json!("hybrid");
-    assert_eq!(mcp.search(&query).await, hybrid);
+    let found = mcp.search(&query).await;
+    assert_mcp_fixture(&found);
+    assert_eq!(
+        successful_tool(mcp.fetch(&found["matches"][0]["ref"]).await)["text"],
+        SOURCE
+    );
     assert_eq!(
         service.web_search(&cookie, &query, StatusCode::OK).await,
         hybrid
@@ -956,7 +1226,7 @@ async fn web_and_mcp_report_embedding_fallback_and_reopen_without_optional_metad
             service.web_search(&cookie, &query, StatusCode::OK).await,
             fallback
         );
-        assert_eq!(mcp.search(&query).await, fallback);
+        assert_mcp_fixture(&mcp.search(&query).await);
         service.stop().await;
     }
     assert_eq!(

@@ -1,4 +1,4 @@
-use std::{fmt::Write as _, sync::Arc};
+use std::sync::Arc;
 
 use axum::{
     Router,
@@ -18,17 +18,21 @@ use rmcp::{
     },
 };
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     catalog::Catalog,
     model_http::{Embedding, Rerank},
-    search::{
-        self, Category, FusionMode, Retrieval, SearchError, SearchReply, SearchRequest, Status,
-    },
+    search::{self, FusionMode, SearchError, SearchRequest},
 };
+
+mod excerpt;
+mod fetch;
+
+use excerpt::{Excerpt, SearchOutput};
+use fetch::{FetchError, SourceRef};
 
 pub(crate) fn router(
     catalog: Arc<Catalog>,
@@ -115,6 +119,14 @@ struct SearchArgs {
     path: Option<String>,
 }
 
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct FetchArgs {
+    /// Opaque reference from a knowledge_search match. Copy it verbatim.
+    #[serde(rename = "ref")]
+    source_ref: String,
+}
+
 #[derive(Clone)]
 struct KnowledgeServer {
     catalog: Arc<Catalog>,
@@ -126,7 +138,8 @@ struct KnowledgeServer {
 #[tool_router]
 impl KnowledgeServer {
     #[tool(
-        description = "Search published Markdown for original excerpts and source locations. Related results are candidates, not verified facts.",
+        description = "Search published enterprise knowledge and code wikis. Returns original excerpts and source locations. Pass a hit's ref to knowledge_fetch for more context. Related hits are not verified facts.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<SearchOutput<'static>>(),
         annotations(read_only_hint = true, destructive_hint = false)
     )]
     async fn knowledge_search(
@@ -151,24 +164,41 @@ impl KnowledgeServer {
                 self.fusion,
             ) => reply,
         };
-        match reply {
-            Ok(reply) => {
-                let content = ContentBlock::text(result_text(&reply));
-                let structured = serde_json::to_value(reply).map_err(|_| {
-                    ErrorData::internal_error("Search result could not be encoded", None)
-                })?;
-                let mut result = CallToolResult::success(vec![content]);
-                result.structured_content = Some(structured);
-                Ok(result)
-            }
-            Err(SearchError::Store) => {
-                let message = "Published index or catalog is unavailable";
-                let mut result = CallToolResult::error(vec![ContentBlock::text(message)]);
-                result.structured_content = Some(json!({"error": "storage", "message": message}));
-                Ok(result)
-            }
+        match reply
+            .and_then(|reply| SearchOutput::from_reply(&reply).map(|output| structured(output)))
+        {
+            Ok(result) => result,
+            Err(SearchError::Store) => Ok(storage_error()),
             Err(SearchError::InvalidInput(message)) => Err(invalid_input(message)),
             Err(SearchError::LibraryNotFound) => Err(invalid_input("library does not exist")),
+        }
+    }
+
+    #[tool(
+        description = "Read the original lines surrounding a search match. Pass the match's ref verbatim.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<Excerpt<'static>>(),
+        annotations(read_only_hint = true, destructive_hint = false)
+    )]
+    async fn knowledge_fetch(
+        &self,
+        Parameters(FetchArgs { source_ref }): Parameters<FetchArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let locator = SourceRef::parse(&source_ref)
+            .ok_or_else(|| invalid_input("invalid search reference"))?;
+        let result = match locator.pin(&self.catalog) {
+            Ok(version) => tokio::task::spawn_blocking(move || fetch::read(version, locator))
+                .await
+                .unwrap_or(Err(FetchError::Store)),
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(context) => structured(context.excerpt()),
+            Err(FetchError::InvalidRef) => Err(invalid_input("invalid search reference")),
+            Err(FetchError::StaleRef) => Ok(CallToolResult::structured_error(json!({
+                "error": "stale_ref",
+                "message": "The referenced version is no longer published; search again"
+            }))),
+            Err(FetchError::Store) => Ok(storage_error()),
         }
     }
 }
@@ -186,37 +216,17 @@ fn invalid_input(message: &'static str) -> ErrorData {
     ErrorData::invalid_params(message, Some(json!({"error": "invalid_input"})))
 }
 
-fn result_text(reply: &SearchReply) -> String {
-    if reply.status == Status::NoPublishedIndex {
-        return "No published index is available in the selected scope.".into();
-    }
-    let retrieval = match reply.retrieval {
-        Retrieval::Keyword => "keyword",
-        Retrieval::Hybrid => "hybrid",
-    };
-    let reranked = if reply.reranked { "yes" } else { "no" };
-    let mut text = format!(
-        "{} matches in the selected scope (retrieval: {retrieval}; reranked: {reranked}).",
-        reply.matches.len(),
-    );
-    for hit in &reply.matches {
-        let category = match hit.category {
-            Category::Exact => "complete name",
-            Category::Related => "related passage",
-        };
-        let _ = write!(
-            text,
-            "\n\n{} / {} (lines {}–{}; {category})\n",
-            hit.library, hit.path, hit.line_start, hit.line_end,
-        );
-        if let Some((end, _)) = hit.text.char_indices().nth(240) {
-            text.push_str(&hit.text[..end]);
-            text.push_str("… [full excerpt in structured result]");
-        } else {
-            text.push_str(&hit.text);
-        }
-    }
-    text
+fn structured(value: impl Serialize) -> Result<CallToolResult, ErrorData> {
+    let value = serde_json::to_value(value)
+        .map_err(|_| ErrorData::internal_error("Tool result could not be encoded", None))?;
+    Ok(CallToolResult::structured(value))
+}
+
+fn storage_error() -> CallToolResult {
+    CallToolResult::structured_error(json!({
+        "error": "storage",
+        "message": "Published index or catalog is unavailable"
+    }))
 }
 
 #[cfg(test)]
