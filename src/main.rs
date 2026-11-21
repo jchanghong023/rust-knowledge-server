@@ -20,7 +20,15 @@ mod surface_tests;
 mod technical;
 mod web;
 
-use std::{env, error::Error, future::Future, io, net::SocketAddr, process::ExitCode, sync::Arc};
+use std::{
+    env,
+    error::Error,
+    future::Future,
+    io,
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    process::ExitCode,
+    sync::Arc,
+};
 
 use axum::{
     Router,
@@ -153,6 +161,16 @@ async fn serve(settings: Settings, mode: RunMode) -> Result<(), Box<dyn Error>> 
         RunMode::Foreground => {
             println!("Data root: {}", catalog.root_path().display());
             println!("Listening on http://{bound}");
+            let web_address = match bound {
+                SocketAddr::V4(address) if address.ip().is_unspecified() => {
+                    SocketAddr::from((Ipv4Addr::LOCALHOST, address.port()))
+                }
+                SocketAddr::V6(address) if address.ip().is_unspecified() => {
+                    SocketAddr::from((Ipv6Addr::LOCALHOST, address.port()))
+                }
+                _ => bound,
+            };
+            println!("Web: http://{web_address}/");
             println!("Fusion mode: {}", fusion.as_str());
         }
         #[cfg(target_os = "linux")]

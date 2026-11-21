@@ -53,7 +53,8 @@ Open `http://127.0.0.1:9333` for the UI. On Linux, the binary also supports `sta
 
 ## Testing & QA
 
-- Use Cargo's built-in harness (`#[test]`, `#[tokio::test]`). Tests are inline or in `src/<module>/tests.rs`; `src/surface_tests.rs` runs real Web and MCP routers over loopback. Focus with `cargo test --locked search::tests::` or `cargo test --locked surface_tests::`.
+- Use Cargo's built-in harness (`#[test]`, `#[tokio::test]`). Most tests are inline or in `src/<module>/tests.rs`; `src/surface_tests.rs` runs real Web and MCP routers over loopback. Focus with `cargo test --locked search::tests::` or `cargo test --locked surface_tests::`.
+- On Windows, `cargo test --locked --test search_quality -- --nocapture` launches the service binary with temporary `USERPROFILE` directories and checks synthetic DFT, code Wiki, and merged Markdown queries over HTTP in keyword, hybrid, and reranked modes. Model endpoints are deterministic loopback stubs; the test does not read real documents or evaluate a real model.
 - Use small, deterministic Markdown fixtures, temporary data roots, and real Edge shards. Stub only model HTTP endpoints on loopback; don't require real credentials. Assert original evidence, required relative ordering, and relevant failure states rather than pinning entire rankings. No checked-in coverage threshold.
 - Linux storage fixtures require private directories on tmpfs; use `(umask 077; TMPDIR=/dev/shm cargo test --locked)` where `/dev/shm` is writable. On Windows use a local fixed-volume temp directory.
 - For UI changes, check the running server in a real browser. Target-host deployment acceptance is separate: follow §4 of `openspec/changes/add-standalone-knowledge-server/tasks.md`; local tests and mocks don't replace it.
