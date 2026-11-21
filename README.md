@@ -27,6 +27,8 @@ flowchart TD
 
 ## 启动（CentOS 7 x64）
 
+从 [GitHub Releases](https://github.com/jchanghong023/rust-knowledge-server/releases) 下载 `rust-knowledge-server-centos7-x86_64.tar.gz` 并解压。
+
 ```sh
 ./rust-knowledge-server
 ```
@@ -44,6 +46,8 @@ flowchart TD
 无需 root。所有数据保存在 `/dev/shm/rust-knowledge-server`。重启进程可复用；机器重启后清空，请自行保存 Markdown 并重新导入。
 
 [构建脚本](release/build-centos7.sh) · `./rust-knowledge-server --help`
+
+推送 `v<主版本>.<次版本>.<修订号>` 标签会触发 GitHub Actions，只构建并发布 CentOS 7 x64 压缩包。手动运行 `Release CentOS 7` 工作流只构建并上传 Actions 产物，不创建 Release。
 
 ## Web
 
