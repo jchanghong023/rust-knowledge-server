@@ -67,6 +67,7 @@ impl Fixture {
                 &batch,
                 embedding.as_deref(),
                 &runtime,
+                |_, _| {},
             )
             .unwrap();
             assert!(error.is_none());

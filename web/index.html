@@ -91,6 +91,7 @@
             </fieldset>
           </form>
           <p id="import-status" class="message" role="status"></p>
+          <progress id="upload-progress" class="import-progress" aria-label="文件上传进度" max="100" hidden></progress>
         </section>
 
         <section id="operations-section" class="subsection" aria-labelledby="operations-title" hidden>
@@ -169,15 +170,15 @@
     </main>
   </div>
 
-  <dialog id="confirmation" aria-labelledby="confirmation-title" aria-describedby="confirmation-message">
-    <form method="dialog">
+  <div id="confirmation" class="dialog-overlay" hidden>
+    <div class="dialog-panel" role="dialog" aria-modal="true" aria-labelledby="confirmation-title" aria-describedby="confirmation-message">
       <h2 id="confirmation-title"></h2>
       <p id="confirmation-message"></p>
       <div class="dialog-actions">
-        <button value="cancel" autofocus>取消</button>
-        <button id="confirm-action" value="confirm"></button>
+        <button id="cancel-confirmation" type="button">取消</button>
+        <button id="confirm-action" type="button"></button>
       </div>
-    </form>
-  </dialog>
+    </div>
+  </div>
 </body>
 </html>

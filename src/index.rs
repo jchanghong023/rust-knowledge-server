@@ -1,7 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::fs;
-use std::io;
+use std::io::{self, BufWriter, Write};
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -10,15 +10,16 @@ use qdrant_edge::{
     CreateIndex, DisabledStemmerParams, Distance, EdgeConfigBuilder, EdgeShard,
     EdgeSparseVectorParamsBuilder, EdgeVectorParamsBuilder, FieldIndexOperations, Memory, Modifier,
     NoStemmer, OperationError, Payload, PayloadFieldSchema, PayloadSchemaType,
-    PointInsertOperations, PointOperations, PointStructPersisted, StemmingAlgorithm,
+    PointInsertOperations, PointOperations, PointStructPersisted, ScrollRequest, StemmingAlgorithm,
     StopwordsInterface, StopwordsSet, TokenizerType, UpdateOperation, VectorPersisted,
-    VectorStorageDatatype, VectorStructPersisted,
+    VectorStorageDatatype, VectorStructPersisted, WithPayloadInterface,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokio::runtime::Handle;
 use uuid::Uuid;
 
+use crate::durable::SOURCE_PATHS;
 use crate::import::{Batch, Document, ImportError};
 use crate::markdown::{self, Section};
 use crate::model_http::{Embedding, ModelError};
@@ -28,6 +29,7 @@ pub(crate) const KEYWORD_VECTOR: &str = "bm25";
 pub(crate) const SEMANTIC_VECTOR: &str = "embedding";
 pub(crate) const SCOPE_FIELD: &str = "scope";
 pub(crate) const EXACT_FIELD: &str = "exact";
+const PATH_FIELD: &str = "path";
 
 // Markdown already limits each section's length. This limits both the Edge update
 // and the corresponding HTTP request independently of the source document size.
@@ -135,6 +137,7 @@ pub(crate) fn build(
     batch: &Batch,
     embedding: Option<&Embedding>,
     runtime: &Handle,
+    mut report_progress: impl FnMut(usize, u64),
 ) -> Result<Option<ModelError>, IndexError> {
     let model = bm25().map_err(|error| IndexError::Storage("configure BM25", error))?;
     // EdgeShard::new by itself permits reusing an existing directory without
@@ -177,7 +180,7 @@ pub(crate) fn build(
 
     let mut embedding_error = None;
     let mut last_id = 0_u64;
-    for document in batch.documents() {
+    for (completed, document) in batch.documents().iter().enumerate() {
         let source = document.read_body().map_err(IndexError::Document)?;
         let scope: Vec<_> = document
             .relative_path
@@ -185,7 +188,10 @@ pub(crate) fn build(
             .map(|(end, _)| &document.relative_path[..end])
             .chain(std::iter::once(document.relative_path.as_str()))
             .collect();
-        for sections in markdown::sections(&source).chunks(POINT_BATCH) {
+        let sections = markdown::sections(&source);
+        let batches = sections.chunks(POINT_BATCH);
+        let batch_count = batches.len();
+        for (number, sections) in batches.enumerate() {
             let mut vectors = Vec::new();
             if let Some(provider) = embedding.filter(|_| embedding_error.is_none()) {
                 let mut inputs = [""; POINT_BATCH];
@@ -223,12 +229,32 @@ pub(crate) fn build(
                     PointOperations::UpsertPoints(PointInsertOperations::PointsList(points)),
                 ))
                 .map_err(|error| IndexError::Edge("write Edge passage batch", error))?;
+            report_progress(completed + usize::from(number + 1 == batch_count), last_id);
+        }
+        if batch_count == 0 {
+            report_progress(completed + 1, last_id);
         }
     }
     shard
         .flush()
         .map_err(|error| IndexError::Edge("flush Edge shard", error))?;
     drop(shard);
+
+    // Record every accepted file, including zero-byte files that have no passages.
+    let mut paths: Vec<_> = batch
+        .documents()
+        .iter()
+        .map(|document| document.relative_path.as_str())
+        .collect();
+    paths.sort_unstable();
+    let mut file = BufWriter::new(
+        fs::File::create_new(index_path.join(SOURCE_PATHS))
+            .map_err(|error| IndexError::Storage("create source path list", error))?,
+    );
+    serde_json::to_writer(&mut file, &paths)
+        .map_err(|error| IndexError::Storage("write source path list", error.into()))?;
+    file.flush()
+        .map_err(|error| IndexError::Storage("flush source path list", error))?;
 
     if let Some(provider) = embedding.filter(|_| last_id != 0 && embedding_error.is_none()) {
         let generation = EmbeddingGeneration {
@@ -246,6 +272,35 @@ pub(crate) fn build(
     Ok(embedding_error)
 }
 
+/// Older versions only recorded paths on passage payloads.
+pub(crate) fn indexed_paths(shard: &EdgeShard) -> io::Result<Vec<String>> {
+    let mut request = ScrollRequest::new();
+    request.limit = Some(256);
+    request.with_payload = Some(WithPayloadInterface::Fields(vec![
+        PATH_FIELD.parse().expect("constant Edge field name"),
+    ]));
+    let mut paths = BTreeSet::new();
+    loop {
+        let (points, next) = shard.scroll(request.clone()).map_err(io::Error::other)?;
+        for point in points {
+            let Some(Value::String(path)) = point
+                .payload
+                .and_then(|mut payload| payload.0.remove(PATH_FIELD))
+            else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "indexed passage has no source path",
+                ));
+            };
+            paths.insert(path);
+        }
+        let Some(next) = next else {
+            return Ok(paths.into_iter().collect());
+        };
+        request.offset = Some(next);
+    }
+}
+
 fn passage_payload(
     document: &Document,
     source: &str,
@@ -257,7 +312,7 @@ fn passage_payload(
     Payload(Map::from_iter(
         [
             ("text", Value::from(section.text)),
-            ("path", Value::from(document.relative_path.as_str())),
+            (PATH_FIELD, Value::from(document.relative_path.as_str())),
             ("line_start", Value::from(section.line_start)),
             ("line_end", Value::from(section.line_end)),
             ("sha256", Value::from(document.sha256.as_str())),

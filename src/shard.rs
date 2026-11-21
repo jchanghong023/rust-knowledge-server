@@ -41,7 +41,6 @@ impl Shard {
     }
 
     /// The constructor path: a version root for published shards, an index for probes.
-    #[cfg(test)]
     pub(crate) fn path(&self) -> &Path {
         match &self.location {
             Location::Probe(path) | Location::Published(path) => path,

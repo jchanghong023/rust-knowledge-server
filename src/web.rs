@@ -16,7 +16,7 @@ use axum::{
         multipart::MultipartRejection,
         rejection::{BytesRejection, JsonRejection, PathRejection, QueryRejection},
     },
-    http::{HeaderMap, HeaderValue, Method, StatusCode, header, request::Parts},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header, request::Parts},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
@@ -67,6 +67,7 @@ pub(crate) fn router(
                 .post(create_library)
                 .layer(DefaultBodyLimit::max(JSON_BODY_LIMIT)),
         )
+        .route("/api/library/paths", get(list_source_paths))
         .route(
             "/api/library",
             delete(delete_library).layer(DefaultBodyLimit::max(SESSION_BODY_LIMIT)),
@@ -92,6 +93,7 @@ pub(crate) fn router(
             jobs,
             blocking_slots: Arc::new(Semaphore::new(4)),
             import_slots: Arc::new(Semaphore::new(2)),
+            imports: Mutex::new(HashMap::new()),
             search_slots: Arc::new(Semaphore::new(4)),
         }))
 }
@@ -106,6 +108,7 @@ struct Web {
     jobs: TaskTracker,
     blocking_slots: Arc<Semaphore>,
     import_slots: Arc<Semaphore>,
+    imports: Mutex<HashMap<Uuid, Arc<Mutex<ImportProgress>>>>,
     search_slots: Arc<Semaphore>,
 }
 
@@ -244,14 +247,27 @@ fn single_header(headers: &HeaderMap, name: header::HeaderName) -> Option<&str> 
 
 fn check_origin(headers: &HeaderMap) -> Result<(), ApiError> {
     let host = single_header(headers, header::HOST).and_then(HttpAuthority::parse);
-    let origin = single_header(headers, header::ORIGIN)
-        .and_then(|origin| origin.strip_prefix("http://"))
-        .and_then(HttpAuthority::parse);
-    if !matches!((host, origin), (Some(host), Some(origin)) if host.same_http_endpoint(&origin)) {
+    let referer;
+    let source = if headers.contains_key(header::ORIGIN) {
+        single_header(headers, header::ORIGIN)
+            .and_then(|origin| origin.strip_prefix("http://"))
+            .and_then(HttpAuthority::parse)
+    } else {
+        // Firefox ESR 68 can omit Origin on same-origin requests.
+        referer = single_header(headers, header::REFERER)
+            .filter(|value| !value.contains('#'))
+            .and_then(|value| value.parse::<Uri>().ok());
+        referer
+            .as_ref()
+            .filter(|uri| uri.scheme_str() == Some("http"))
+            .and_then(Uri::authority)
+            .and_then(|authority| HttpAuthority::parse(authority.as_str()))
+    };
+    if !matches!((host, source), (Some(host), Some(source)) if host.same_http_endpoint(&source)) {
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
             "forbidden",
-            "a single matching HTTP Origin header is required",
+            "a single matching HTTP Origin or, if absent, Referer header is required",
         ));
     }
     Ok(())
@@ -386,6 +402,28 @@ struct LibraryRequest {
     name: String,
 }
 
+#[derive(Serialize)]
+struct SourcePathsReply {
+    paths: Vec<String>,
+    complete: bool,
+}
+
+async fn list_source_paths(
+    State(web): State<Arc<Web>>,
+    _: Employee,
+    request: Result<Query<LibraryRequest>, QueryRejection>,
+) -> Result<impl IntoResponse, ApiError> {
+    let Query(LibraryRequest { name }) = request
+        .map_err(|_| ApiError::invalid("a single library name query parameter is required"))?;
+    let (paths, complete) = web
+        .blocking(move |web| Ok(web.catalog.source_paths(&name)?))
+        .await?;
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(SourcePathsReply { paths, complete }),
+    ))
+}
+
 async fn create_library(
     State(web): State<Arc<Web>>,
     employee: Employee,
@@ -425,6 +463,26 @@ async fn delete_library(
 #[derive(Serialize)]
 struct AcceptedImport {
     id: Uuid,
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(tag = "phase", rename_all = "snake_case")]
+enum ImportProgress {
+    Queued,
+    Indexing {
+        files_done: usize,
+        files_total: usize,
+        passages: u64,
+    },
+    Publishing,
+}
+
+#[derive(Serialize)]
+struct OperationReply {
+    #[serde(flatten)]
+    status: OperationStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    progress: Option<ImportProgress>,
 }
 
 async fn import_library(
@@ -469,18 +527,35 @@ async fn import_library(
                 return;
             }
         };
+        let id = op.id;
+        let progress = Arc::new(Mutex::new(ImportProgress::Queued));
+        worker
+            .imports
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(id, Arc::clone(&progress));
         let _ = submitted.send(Ok(op.id));
         // The tracked task owns all state after staging and completes even if
         // the browser disconnects. Shutdown waits for it before dropping Edge.
-        let id = op.id;
-        if let Err(error) = worker
+        let result = worker
             .blocking(move |web| {
+                let files_total = batch.documents().len();
+                let report_progress = |files_done, passages| {
+                    *progress.lock().unwrap_or_else(|error| error.into_inner()) =
+                        ImportProgress::Indexing {
+                            files_done,
+                            files_total,
+                            passages,
+                        };
+                };
+                report_progress(0, 0);
                 let result = index::build(
                     &build.index_path(),
                     build.version_id(),
                     &batch,
                     web.embedding.as_deref(),
                     &runtime,
+                    report_progress,
                 );
                 match result {
                     Ok(Some(error)) => {
@@ -496,10 +571,17 @@ async fn import_library(
                     }
                 }
                 drop(batch);
+                *progress.lock().unwrap_or_else(|error| error.into_inner()) =
+                    ImportProgress::Publishing;
                 web.finish_catalog(&op, web.catalog.publish(build, Some(op.id)))
             })
-            .await
-        {
+            .await;
+        worker
+            .imports
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&id);
+        if let Err(error) = result {
             let _ = writeln!(io::stderr().lock(), "import {id}: {}", error.code);
         }
     }));
@@ -547,7 +629,7 @@ async fn operation_status(
     id: Result<Path<Uuid>, PathRejection>,
 ) -> Result<impl IntoResponse, ApiError> {
     let Path(id) = id.map_err(|_| ApiError::invalid("operation id must be a UUID"))?;
-    let status: OperationStatus = web
+    let status = web
         .blocking(move |web| {
             web.audit
                 .status(id, &web.catalog)
@@ -555,7 +637,21 @@ async fn operation_status(
                 .ok_or_else(|| ApiError::not_found("operation does not exist"))
         })
         .await?;
-    Ok(([(header::CACHE_CONTROL, "no-store")], Json(status)))
+    let progress = if status.outcome == Outcome::InProgress {
+        let progress = web
+            .imports
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&id)
+            .cloned();
+        progress.map(|progress| *progress.lock().unwrap_or_else(|error| error.into_inner()))
+    } else {
+        None
+    };
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(OperationReply { status, progress }),
+    ))
 }
 
 async fn recent_employees(State(web): State<Arc<Web>>) -> Result<impl IntoResponse, ApiError> {

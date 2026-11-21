@@ -943,27 +943,43 @@ async fn web_denies_untrusted_writes_and_bad_batches_preserve_the_published_vers
         .await,
         StatusCode::UNAUTHORIZED,
     );
+    let referer = format!("{}/?from=workbench", service.server.origin);
     assert_status(
         &send(
             service
-                .web(Method::POST, "/api/libraries", None)
+                .request(Method::POST, "/api/libraries")
+                .header(header::REFERER, &referer)
                 .json(&json!({"name": "without-session"})),
         )
         .await,
         StatusCode::UNAUTHORIZED,
     );
-    let cross_origin = send(
-        service
+    for headers in [
+        &[][..],
+        &[("referer", "/")],
+        &[("referer", FOREIGN_ORIGIN)],
+        &[("referer", &referer), ("referer", &referer)],
+        &[("origin", "null"), ("referer", &referer)],
+        &[("origin", FOREIGN_ORIGIN), ("referer", &referer)],
+        &[
+            ("origin", service.server.origin.as_str()),
+            ("origin", service.server.origin.as_str()),
+            ("referer", &referer),
+        ],
+    ] {
+        let mut request = service
             .request(Method::POST, "/api/libraries")
-            .header(header::ORIGIN, FOREIGN_ORIGIN)
             .header(header::COOKIE, &cookie)
-            .json(&json!({"name": "cross-origin"})),
-    )
-    .await;
-    assert_status(&cross_origin, StatusCode::FORBIDDEN);
+            .json(&json!({"name": "untrusted-source"}));
+        for &(name, value) in headers {
+            request = request.header(name, value);
+        }
+        assert_status(&send(request).await, StatusCode::FORBIDDEN);
+    }
     let injection = send(
         service
             .web(Method::POST, "/api/libraries", Some(&cookie))
+            .header(header::REFERER, FOREIGN_ORIGIN)
             .json(&json!({"name": "injected", "employee": "99999999"})),
     )
     .await;
@@ -1007,7 +1023,15 @@ async fn web_denies_untrusted_writes_and_bad_batches_preserve_the_published_vers
     assert_eq!(service.libraries(&cookie).await, json!([]));
     assert_eq!(service.audit_records(), registration);
 
-    service.create(&cookie).await;
+    let created = send(
+        service
+            .request(Method::POST, "/api/libraries")
+            .header(header::REFERER, &referer)
+            .header(header::COOKIE, &cookie)
+            .json(&json!({"name": LIBRARY})),
+    )
+    .await;
+    assert_status(&created, StatusCode::CREATED);
     service.publish_fixture(&cookie).await;
     let query = fixture_query();
     let published = service.web_search(&cookie, &query, StatusCode::OK).await;

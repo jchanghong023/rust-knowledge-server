@@ -14,6 +14,7 @@ use crate::index::{EMBEDDING_GENERATION, EmbeddingGeneration};
 const INDEX: &str = "index";
 const MANIFEST: &str = "integrity.json";
 const EDGE_CONFIG: &str = "edge_config.json";
+pub(crate) const SOURCE_PATHS: &str = "source-paths.json";
 
 pub(crate) enum CommitError {
     Unchanged(io::Error),
@@ -125,12 +126,7 @@ pub(crate) fn seal_version(build_dir: &Path, published_dir: &Path) -> io::Result
 pub(crate) fn verify_version(
     published_dir: &Path,
 ) -> io::Result<Option<EmbeddingGeneration<String>>> {
-    check_root_entries(published_dir, true)?;
-    let manifest = published_dir.join(MANIFEST);
-    require_file(&manifest)?;
-    let file = at(&manifest, "open integrity manifest", File::open(&manifest))?;
-    let mut entries: BTreeMap<String, Entry> = serde_json::from_reader(BufReader::new(file))
-        .map_err(|error| context(&manifest, "parse integrity manifest", error.into()))?;
+    let mut entries = read_manifest(published_dir)?;
 
     let index = published_dir.join(INDEX);
     let embedding = entries.remove(EMBEDDING_GENERATION);
@@ -176,19 +172,50 @@ pub(crate) fn verify_version(
     Ok(embedding.and_then(|entry| verify_embedding(&index.join(EMBEDDING_GENERATION), entry)))
 }
 
-fn verify_embedding(path: &Path, entry: Entry) -> Option<EmbeddingGeneration<String>> {
-    let Entry::File { size, sha256 } = entry else {
-        return None;
+/// Read only the sealed path list; browsing a library need not load its search index.
+pub(crate) fn read_source_paths(published_dir: &Path) -> io::Result<Option<Vec<String>>> {
+    let Some(entry) = read_manifest(published_dir)?.remove(SOURCE_PATHS) else {
+        return Ok(None);
     };
-    let metadata = checked_metadata(path).ok()?;
-    if !metadata.is_file() || metadata.len() != size {
-        return None;
-    }
-    let bytes = fs::read(path).ok()?;
-    if <[u8; 32]>::from(Sha256::digest(&bytes)) != sha256 {
-        return None;
-    }
+    let index = published_dir.join(INDEX);
+    require_dir(&index)?;
+    let path = index.join(SOURCE_PATHS);
+    let bytes = read_verified_file(&path, entry)?;
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|error| context(&path, "parse source path list", error.into()))
+}
+
+fn read_manifest(published_dir: &Path) -> io::Result<BTreeMap<String, Entry>> {
+    check_root_entries(published_dir, true)?;
+    let manifest = published_dir.join(MANIFEST);
+    require_file(&manifest)?;
+    let file = at(&manifest, "open integrity manifest", File::open(&manifest))?;
+    serde_json::from_reader(BufReader::new(file))
+        .map_err(|error| context(&manifest, "parse integrity manifest", error.into()))
+}
+
+fn verify_embedding(path: &Path, entry: Entry) -> Option<EmbeddingGeneration<String>> {
+    let bytes = read_verified_file(path, entry).ok()?;
     serde_json::from_slice(&bytes).ok()
+}
+
+fn read_verified_file(path: &Path, entry: Entry) -> io::Result<Vec<u8>> {
+    let Entry::File { size, sha256 } = entry else {
+        return Err(invalid(path, "not a file in the integrity manifest"));
+    };
+    let metadata = checked_metadata(path)?;
+    if !metadata.is_file() || metadata.len() != size {
+        return Err(invalid(
+            path,
+            "file type or size does not match integrity manifest",
+        ));
+    }
+    let bytes = fs::read(path)?;
+    if <[u8; 32]>::from(Sha256::digest(&bytes)) != sha256 {
+        return Err(invalid(path, "SHA-256 does not match integrity manifest"));
+    }
+    Ok(bytes)
 }
 
 #[derive(Deserialize, Serialize)]

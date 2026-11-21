@@ -44,10 +44,12 @@ async fn build_fixture(
     let batch = crate::import::stage(multipart, root).await.unwrap();
     let path = root.join("index");
     let runtime = Handle::current();
-    tokio::task::spawn_blocking(move || build(&path, version, &batch, embedding.as_ref(), &runtime))
-        .await
-        .unwrap()
-        .unwrap()
+    tokio::task::spawn_blocking(move || {
+        build(&path, version, &batch, embedding.as_ref(), &runtime, |_, _| {})
+    })
+    .await
+    .unwrap()
+    .unwrap()
 }
 
 fn matching(field: &str, value: &str) -> Condition {

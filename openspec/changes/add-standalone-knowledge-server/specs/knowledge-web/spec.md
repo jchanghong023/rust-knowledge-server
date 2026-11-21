@@ -6,6 +6,14 @@
 
 ## ADDED Requirements
 
+### Requirement: CentOS 7.9 自带浏览器兼容
+
+Web 页面 MUST 在 CentOS 7.9 x64 原始发行包提供的 Firefox ESR 68.10.0 默认设置下，通过内网 HTTP 直连提供完整的 Web 功能。用户 MUST NOT 被要求升级浏览器、修改浏览器设置、安装扩展或访问外网。
+
+#### Scenario: 使用目标浏览器完成知识库操作和查看活动记录
+- **WHEN** 操作者用未升级的 Firefox ESR 68.10.0 访问实际运行的服务
+- **THEN** 已登记用户可建库、上传 Markdown 文件或嵌套目录并保留相对路径、查看导入状态、确认整库重导和删除、搜索并查看证据与来源；未登记访客可查看活动名单及个人操作历史
+
 ### Requirement: 浏览器工号登记
 
 浏览器管理和搜索 MUST 要求有效登记会话。服务 MUST 只接受恰好 8 位 ASCII 数字作为工号，按字符串保留前导零；MUST NOT 查名册、要求密码、验证员工身份或按工号划分权限。
@@ -20,7 +28,11 @@
 
 #### Scenario: HTTP 同源检查无需配置浏览器地址
 - **WHEN** 浏览器以 HTTP 访问服务端 IP，或用 `localhost` 访问本机，发起登记或 POST/DELETE API 请求
-- **THEN** 服务先按连接端点校验 Host，再校验单个 HTTP Origin 的主机和端口与 Host 一致；缺少 Origin、重复头或来源不匹配时拒绝，不读取转发头作为替代
+- **THEN** 服务先按连接端点校验 Host。有 Origin 时须为单个合法 HTTP 源且主机和端口与 Host 一致；仅在完全没有 Origin 时，才可用单个合法的绝对 HTTP Referer URL 校验其源，且主机和端口仍须与 Host 一致。不读取转发头作为替代，原有登记会话规则不变
+
+#### Scenario: 不接受无效或无法核验的来源
+- **WHEN** Origin 非法、重复或与 Host 不匹配，或 Origin 缺失且没有单个合法且同源的 HTTP Referer
+- **THEN** 服务拒绝请求；存在无效 Origin 时，即使 Referer 同源也不放行
 
 ### Requirement: 浏览器管理与搜索测试
 

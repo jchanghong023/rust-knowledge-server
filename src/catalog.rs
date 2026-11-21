@@ -11,7 +11,7 @@ use qdrant_edge::EdgeShard;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{data_root::Root, durable, model_http::Embedding, shard::Shard};
+use crate::{data_root::Root, durable, index, model_http::Embedding, shard::Shard};
 
 const CATALOG: &str = "catalog.json";
 const FORMAT: u32 = 1;
@@ -480,6 +480,29 @@ impl Catalog {
             .get(&version_id)
             .filter(|version| version.library_id == library_id)
             .cloned())
+    }
+
+    pub(crate) fn source_paths(&self, name: &str) -> Result<(Vec<String>, bool), CatalogError> {
+        let version = {
+            let state = self.lock()?;
+            state
+                .table
+                .libraries
+                .get(name)
+                .ok_or(CatalogError::NotFound)?
+                .version_id
+                .map(|id| Arc::clone(&state.versions[&id]))
+        };
+        let Some(version) = version else {
+            return Ok((Vec::new(), true));
+        };
+        if let Some(paths) = durable::read_source_paths(version.shard().path())? {
+            return Ok((paths, true));
+        }
+        let shard = version
+            .open()
+            .map_err(|error| io::Error::new(error.kind(), error.to_string()))?;
+        Ok((index::indexed_paths(shard)?, false))
     }
 
     pub(crate) fn receipt(&self, operation: Uuid) -> Result<Option<Receipt>, CatalogError> {
