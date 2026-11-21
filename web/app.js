@@ -328,6 +328,111 @@ function evidenceResult(hit) {
   return item;
 }
 
+const activity = byId("activity");
+const activityRefresh = byId("refresh-activity");
+const activityRoster = byId("activity-roster");
+const activityActions = { create: "创建", import: "导入", delete: "删除", search: "搜索" };
+const activityOutcomes = {
+  in_progress: "进行中", succeeded: "成功", failed: "失败", interrupted: "中断", unknown: "结果未知",
+};
+const activityTime = new Intl.DateTimeFormat("zh-CN", {
+  year: "numeric", month: "2-digit", day: "2-digit",
+  hour: "2-digit", minute: "2-digit", second: "2-digit",
+  hourCycle: "h23", timeZoneName: "short",
+});
+
+function timestamp(ms) {
+  const date = new Date(ms);
+  const time = element("time", activityTime.format(date));
+  time.dateTime = date.toISOString();
+  return time;
+}
+
+function operationTable(events, employeeNumber) {
+  const table = element("table");
+  table.className = "activity-events";
+  table.setAttribute("aria-label", `自报工号 ${employeeNumber} 的操作历史`);
+  const header = table.createTHead().insertRow();
+  for (const title of ["开始时间", "操作", "目标库", "结果"]) {
+    const th = element("th", title);
+    th.scope = "col";
+    header.append(th);
+  }
+  const body = table.createTBody();
+  for (const event of events) {
+    const row = body.insertRow();
+    row.insertCell().append(timestamp(event.started_at_ms));
+    row.insertCell().textContent = activityActions[event.action];
+    row.insertCell().textContent = event.library ?? (event.action === "search" ? "全部知识库" : "—");
+    row.insertCell().textContent = activityOutcomes[event.outcome];
+  }
+  return table;
+}
+
+function activityEmployee({ employee: number, last_registered_at_ms }, expanded) {
+  const row = element("li");
+  const details = element("details");
+  details.dataset.employee = number;
+  const summary = element("summary");
+  summary.append(element("strong", number), timestamp(last_registered_at_ms));
+  const status = element("p");
+  status.id = `activity-status-${number}`;
+  status.className = "message";
+  status.setAttribute("role", "status");
+  const history = element("div");
+  details.append(summary, status, history);
+  row.append(details);
+  let loading = false;
+  details.addEventListener("toggle", async () => {
+    if (!details.isConnected || !details.open || loading) return;
+    loading = true;
+    history.replaceChildren();
+    message(status.id, "正在读取操作历史…");
+    try {
+      const events = await request(`/api/activity/${encodeURIComponent(number)}`, { credentials: "omit" });
+      if (!details.isConnected) return;
+      if (events.length) history.append(operationTable(events, number));
+      message(status.id, events.length ? `共 ${events.length} 条操作。` : "该工号暂无操作记录。");
+    } catch (error) {
+      if (details.isConnected) showError(status.id, "读取操作历史失败，可收起后重新展开", error);
+    } finally {
+      loading = false;
+    }
+  });
+  details.open = expanded;
+  return row;
+}
+
+async function refreshActivity() {
+  if (activityRefresh.disabled) return;
+  activityRefresh.disabled = true;
+  message("activity-status", "正在读取最近登记…");
+  try {
+    const employees = await request("/api/activity", { credentials: "omit" });
+    const expanded = new Set(Array.from(
+      activityRoster.querySelectorAll("details[open]"), (details) => details.dataset.employee));
+    const rows = document.createDocumentFragment();
+    for (const employee of employees) rows.append(activityEmployee(employee, expanded.has(employee.employee)));
+    activityRoster.replaceChildren(rows);
+    message("activity-status", employees.length ? `共 ${employees.length} 个自报工号。` : "最近 30 天暂无成功登记。");
+  } catch (error) {
+    const action = activityRoster.childElementCount
+      ? "刷新活动记录失败，当前显示的是上次读取的数据"
+      : "读取活动记录失败，请刷新重试";
+    showError("activity-status", action, error);
+  } finally {
+    activityRefresh.disabled = false;
+  }
+}
+
+byId("activity-link").addEventListener("click", () => {
+  if (activity.open) void refreshActivity();
+  else activity.open = true;
+});
+activity.addEventListener("toggle", () => { if (activity.open) void refreshActivity(); });
+activityRefresh.addEventListener("click", () => void refreshActivity());
+if (location.hash === "#activity") activity.open = true;
+
 async function start() {
   try {
     for (const { id, name } of JSON.parse(sessionStorage.getItem(operationsKey) || "[]")) {

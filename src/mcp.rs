@@ -35,15 +35,9 @@ pub(crate) fn router(
     embedding: Option<Arc<Embedding>>,
     rerank: Option<Arc<Rerank>>,
     fusion: FusionMode,
-    allowed_hosts: Vec<String>,
     mut allowed_origins: Vec<String>,
     cancellation_token: CancellationToken,
 ) -> Router {
-    // The SDK interprets an empty Host list as allow-all. Startup must provide one.
-    assert!(
-        !allowed_hosts.is_empty(),
-        "MCP requires an explicit Host allowlist"
-    );
     // rmcp 3.11 treats a portless allowlist entry as any port, unlike a browser origin.
     for origin in &mut allowed_origins {
         let Some((scheme, authority)) = origin.split_once("://") else {
@@ -58,7 +52,8 @@ pub(crate) fn router(
         }
     }
     let config = StreamableHttpServerConfig::default()
-        .with_allowed_hosts(allowed_hosts)
+        // The shared HTTP layer checks Host against the accepted TCP socket.
+        .disable_allowed_hosts()
         .with_allowed_origins(allowed_origins)
         .enforce_origin_validation()
         .with_cancellation_token(cancellation_token);
@@ -75,7 +70,7 @@ pub(crate) fn router(
     );
     Router::new()
         .route_service("/mcp", service)
-        .route_layer(middleware::from_fn(reject_ambiguous_headers))
+        .route_layer(middleware::from_fn(reject_ambiguous_origin))
 }
 
 fn port_suffix(authority: &str) -> Option<&str> {
@@ -83,12 +78,9 @@ fn port_suffix(authority: &str) -> Option<&str> {
     authority[host_end..].split_once(':').map(|(_, port)| port)
 }
 
-async fn reject_ambiguous_headers(request: Request, next: Next) -> Response {
-    // rmcp checks only the first Host and Origin field. Reject duplicates before it runs.
+async fn reject_ambiguous_origin(request: Request, next: Next) -> Response {
+    // rmcp checks only the first Origin field.
     let headers = request.headers();
-    if headers.get_all(header::HOST).iter().nth(1).is_some() {
-        return (StatusCode::BAD_REQUEST, "Duplicate Host header").into_response();
-    }
     let mut origins = headers.get_all(header::ORIGIN).iter();
     if let Some(origin) = origins.next()
         && (origins.next().is_some() || !origin.to_str().is_ok_and(is_serialized_origin))

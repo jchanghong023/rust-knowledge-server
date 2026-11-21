@@ -1,9 +1,9 @@
 use std::ffi::OsString;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-use std::path::{Component, Path, Prefix};
+use std::path::{Component, Path, PathBuf, Prefix};
 use std::ptr::null_mut;
 
 use windows_sys::Win32::Storage::FileSystem::{
@@ -11,6 +11,45 @@ use windows_sys::Win32::Storage::FileSystem::{
     GetDriveTypeW, GetVolumeInformationW, GetVolumePathNameW,
 };
 use windows_sys::Win32::System::WindowsProgramming::{DRIVE_FIXED, DRIVE_REMOTE};
+
+pub(super) fn default_path() -> io::Result<PathBuf> {
+    std::env::home_dir()
+        .filter(|home| home.is_absolute())
+        .map(|home| home.join(".rust-knowledge-server"))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "cannot determine the user home directory",
+            )
+        })
+}
+
+pub(super) fn prepare_directory(path: &Path) -> io::Result<PathBuf> {
+    check_path_namespace(path)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| unsupported("data root has no parent"))?;
+    for ancestor in parent.ancestors() {
+        super::check_directory(ancestor, &fs::symlink_metadata(ancestor)?)?;
+    }
+    let parent = parent.canonicalize()?;
+    check_storage(&parent)?;
+    let path = parent.join(
+        path.file_name()
+            .ok_or_else(|| unsupported("data root has no name"))?,
+    );
+    match fs::create_dir(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    super::check_directory(&path, &fs::symlink_metadata(&path)?)?;
+    Ok(path)
+}
+
+pub(super) fn is_reparse_point(metadata: &fs::Metadata) -> bool {
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
 
 pub(super) fn check_path_namespace(path: &Path) -> io::Result<()> {
     match path.components().next() {
@@ -123,7 +162,7 @@ pub(super) fn open_lock(path: &Path) -> io::Result<File> {
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)?;
     let metadata = lock.metadata()?;
-    if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+    if !metadata.is_file() || is_reparse_point(&metadata) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "lock must be a regular file, not a reparse point",

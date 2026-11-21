@@ -2,7 +2,7 @@
 
 ## Purpose
 
-提供标准 Streamable HTTP MCP 接口，让公司内网的兼容客户端能发现并调用同一个只读知识库工具，无需专用集成或浏览器会话。
+提供标准 Streamable HTTP MCP 接口，让兼容客户端能发现并调用同一个只读知识库工具，无需专用集成或浏览器会话。
 
 ## ADDED Requirements
 
@@ -11,11 +11,11 @@
 服务 MUST 在同一个 `/mcp` 地址提供标准 Streamable HTTP MCP，并支持客户端完成协议初始化、工具发现和工具调用。客户端 MUST NOT 依赖专用代理、自定义传输、登记工号、浏览器会话或登录凭据。
 
 #### Scenario: 两个独立的原生客户端使用同一地址
-- **WHEN** 两个独立的 MCP 客户端各自使用原生 Streamable HTTP 配置连接同一内网地址
+- **WHEN** 两个独立的 MCP 客户端各自使用原生 Streamable HTTP 配置连接同一服务地址
 - **THEN** 两者能完成协议握手，发现并调用 `knowledge_search`，取得本次检索的原文证据和来源
 
-#### Scenario: 内网部署域名与请求来源
-- **WHEN** 原生客户端用允许的内网 Host 且不发送 `Origin`，或请求携带不允许的 `Origin`
+#### Scenario: 请求 Host 与来源校验
+- **WHEN** 原生客户端连接服务，以实际服务端 IP 和端口作为 Host 且不发送 `Origin`，或请求携带不匹配的 Host 或不允许的 `Origin`
 - **THEN** 前者可完成标准 MCP 初始化；后者返回 HTTP 403、不执行工具调用
 
 #### Scenario: MCP 不提供管理操作

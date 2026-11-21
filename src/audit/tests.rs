@@ -252,3 +252,44 @@ fn terminal_result_cannot_be_replaced() {
         audit.path(id, RESULT)
     );
 }
+
+#[test]
+fn recent_employees_include_the_boundary_and_latest_successful_registration_only() {
+    let disk = tempfile::tempdir().unwrap();
+    let (_, audit) = open(disk.path());
+    let now = RECENT_MS * 2;
+    for (employee, timestamp_ms, outcome) in [
+        ("00000001", now - RECENT_MS - 1, Outcome::Succeeded),
+        ("00000002", now - RECENT_MS, Outcome::Succeeded),
+        ("00000003", now - 20, Outcome::Succeeded),
+        ("00000003", now - 10, Outcome::Succeeded),
+        ("00000003", now, Outcome::Failed),
+        ("00000004", now, Outcome::Failed),
+        ("00000005", now + 1, Outcome::Succeeded),
+    ] {
+        let id = Uuid::new_v4();
+        audit
+            .write_new(
+                id,
+                REGISTRATION,
+                &Registration {
+                    id,
+                    employee,
+                    employee_self_reported: true,
+                    action: "register",
+                    outcome,
+                    timestamp_ms,
+                },
+            )
+            .unwrap();
+    }
+    let roster = audit.recent_employees_at(now).unwrap();
+    let times: Vec<_> = roster
+        .iter()
+        .map(|entry| (entry.employee.as_str(), entry.last_registered_at_ms))
+        .collect();
+    assert_eq!(
+        times,
+        [("00000003", now - 10), ("00000002", now - RECENT_MS)]
+    );
+}

@@ -3,7 +3,6 @@ use std::{fmt, time::Duration};
 use reqwest::{Client, StatusCode, Url, header::HeaderValue};
 use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 
-#[derive(Deserialize)]
 pub(crate) struct ApiConfig {
     pub(crate) base_url: String,
     pub(crate) model: String,

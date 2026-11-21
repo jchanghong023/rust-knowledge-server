@@ -1,12 +1,43 @@
 use std::ffi::CString;
-use std::fs::{self, File};
+use std::fs::{self, DirBuilder, File};
 use std::io;
 use std::mem::MaybeUninit;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-use std::path::Path;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
 
-pub(super) fn check_storage(path: &Path) -> io::Result<()> {
+pub(super) fn prepare_directory(path: &Path) -> io::Result<PathBuf> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| unsupported("data root has no parent"))?;
+    if parent.canonicalize()? != parent {
+        return Err(unsupported("data root parent must not be redirected"));
+    }
+    check_storage(parent)?;
+    match DirBuilder::new().mode(0o700).create(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    check_private_directory(path)?;
+    check_same_mount(parent, path)?;
+    Ok(path.to_path_buf())
+}
+
+pub(crate) fn check_private_directory(path: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    super::check_directory(path, &metadata)?;
+    // SAFETY: geteuid has no arguments or memory side effects.
+    if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "data root must be owned by the service user and private",
+        ));
+    }
+    Ok(())
+}
+
+fn check_storage(path: &Path) -> io::Result<()> {
     let name = CString::new(path.as_os_str().as_bytes())?;
     let mut stats = MaybeUninit::<libc::statfs>::uninit();
     // SAFETY: name is NUL-terminated; stats has space for a statfs result.
@@ -15,25 +46,16 @@ pub(super) fn check_storage(path: &Path) -> io::Result<()> {
     }
     // SAFETY: successful statfs initialized the result.
     let stats = unsafe { stats.assume_init() };
-    if !matches!(stats.f_type, libc::EXT4_SUPER_MAGIC | libc::XFS_SUPER_MAGIC) {
+    if stats.f_type != libc::TMPFS_MAGIC {
         return Err(unsupported(format!(
-            "filesystem type {:#x} is not ext or XFS",
+            "filesystem type {:#x} is not tmpfs",
             stats.f_type
         )));
     }
-
-    let device = fs::metadata(path)?.dev();
-    let number = format!("{}:{}", libc::major(device), libc::minor(device));
-    let sysfs = Path::new("/sys/dev/block").join(&number);
-    require_backing_device(&sysfs, 8).map_err(|error| {
-        unsupported(format!(
-            "cannot confirm persistent block backing for device {number}: {error}"
-        ))
-    })
+    Ok(())
 }
 
 pub(super) fn check_same_mount(root: &Path, path: &Path) -> io::Result<()> {
-    check_storage(path)?;
     if fs::metadata(root)?.dev() != fs::metadata(path)?.dev() {
         return Err(unsupported(
             "managed directory must be on the data root device",
@@ -69,42 +91,6 @@ pub(super) fn check_same_mount(root: &Path, path: &Path) -> io::Result<()> {
                 "mount points are not allowed in managed storage",
             ));
         }
-    }
-    Ok(())
-}
-
-fn require_backing_device(path: &Path, layers_left: u8) -> io::Result<()> {
-    let sysfs = path.canonicalize()?;
-    if !sysfs.starts_with("/sys/devices") {
-        return Err(unsupported("block device is not registered in sysfs"));
-    }
-    if !sysfs.starts_with("/sys/devices/virtual") {
-        return Ok(());
-    }
-
-    // Permit device-mapper and MD only if all their backing devices are known. Other
-    // virtual devices (loop, RAM, zram, NBD, etc.) cannot establish local persistence.
-    // sysfs cannot tell whether a hypervisor or storage controller uses durable media.
-    let name = sysfs.file_name().unwrap_or_default().as_bytes();
-    if layers_left == 0 || !(name.starts_with(b"dm-") || name.starts_with(b"md")) {
-        return Err(unsupported(format!(
-            "unsupported virtual block device '{}'",
-            sysfs.display()
-        )));
-    }
-    if sysfs.join("partition").try_exists()? {
-        let parent = sysfs
-            .parent()
-            .ok_or_else(|| unsupported("block partition has no parent device"))?;
-        return require_backing_device(parent, layers_left - 1);
-    }
-    let mut slaves = fs::read_dir(sysfs.join("slaves"))?;
-    let first = slaves
-        .next()
-        .ok_or_else(|| unsupported("no backing devices found in sysfs"))??;
-    require_backing_device(&first.path(), layers_left - 1)?;
-    for slave in slaves {
-        require_backing_device(&slave?.path(), layers_left - 1)?;
     }
     Ok(())
 }

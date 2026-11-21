@@ -35,6 +35,7 @@ use crate::{
     index,
     model_http::{Embedding, Rerank},
     search::{self, FusionMode, SearchError, SearchRequest},
+    settings::HttpAuthority,
 };
 
 const COOKIE: &str = "knowledge_session";
@@ -51,7 +52,6 @@ pub(crate) fn router(
     embedding: Option<Arc<Embedding>>,
     rerank: Option<Arc<Rerank>>,
     fusion: FusionMode,
-    origin: String,
     jobs: TaskTracker,
 ) -> Router {
     Router::new()
@@ -76,6 +76,8 @@ pub(crate) fn router(
             post(import_library).layer(DefaultBodyLimit::max(IMPORT_BODY_LIMIT)),
         )
         .route("/api/operations/{id}", get(operation_status))
+        .route("/api/activity", get(recent_employees))
+        .route("/api/activity/{employee}", get(employee_activity))
         .route(
             "/api/search",
             post(run_search).layer(DefaultBodyLimit::max(JSON_BODY_LIMIT)),
@@ -86,8 +88,6 @@ pub(crate) fn router(
             embedding,
             rerank,
             fusion,
-            secure_cookie: origin.starts_with("https://"),
-            origin,
             sessions: Mutex::new(Sessions::default()),
             jobs,
             blocking_slots: Arc::new(Semaphore::new(4)),
@@ -102,8 +102,6 @@ struct Web {
     embedding: Option<Arc<Embedding>>,
     rerank: Option<Arc<Rerank>>,
     fusion: FusionMode,
-    origin: String,
-    secure_cookie: bool,
     sessions: Mutex<Sessions>,
     jobs: TaskTracker,
     blocking_slots: Arc<Semaphore>,
@@ -129,22 +127,6 @@ impl Web {
             })
             .await
             .map_err(|_| ApiError::worker())?
-    }
-
-    fn same_origin(&self, headers: &HeaderMap) -> Result<(), ApiError> {
-        let mut origins = headers.get_all(header::ORIGIN).iter();
-        let matching = origins
-            .next()
-            .is_some_and(|origin| origin.as_bytes() == self.origin.as_bytes());
-        if matching && origins.next().is_none() {
-            Ok(())
-        } else {
-            Err(ApiError::new(
-                StatusCode::FORBIDDEN,
-                "forbidden",
-                "a single matching Origin header is required",
-            ))
-        }
     }
 
     fn begin(
@@ -254,16 +236,34 @@ impl Sessions {
     }
 }
 
+fn single_header(headers: &HeaderMap, name: header::HeaderName) -> Option<&str> {
+    let mut values = headers.get_all(name).iter();
+    let value = values.next()?.to_str().ok()?;
+    values.next().is_none().then_some(value)
+}
+
+fn check_origin(headers: &HeaderMap) -> Result<(), ApiError> {
+    let host = single_header(headers, header::HOST).and_then(HttpAuthority::parse);
+    let origin = single_header(headers, header::ORIGIN)
+        .and_then(|origin| origin.strip_prefix("http://"))
+        .and_then(HttpAuthority::parse);
+    if !matches!((host, origin), (Some(host), Some(origin)) if host.same_http_endpoint(&origin)) {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "a single matching HTTP Origin header is required",
+        ));
+    }
+    Ok(())
+}
+
 struct SameOrigin;
 
 impl FromRequestParts<Arc<Web>> for SameOrigin {
     type Rejection = ApiError;
 
-    async fn from_request_parts(
-        parts: &mut Parts,
-        web: &Arc<Web>,
-    ) -> Result<Self, Self::Rejection> {
-        web.same_origin(&parts.headers)?;
+    async fn from_request_parts(parts: &mut Parts, _: &Arc<Web>) -> Result<Self, Self::Rejection> {
+        check_origin(&parts.headers)?;
         Ok(Self)
     }
 }
@@ -276,7 +276,7 @@ impl FromRequestParts<Arc<Web>> for Employee {
         web: &Arc<Web>,
     ) -> Result<Self, Self::Rejection> {
         if !matches!(parts.method, Method::GET | Method::HEAD) {
-            web.same_origin(&parts.headers)?;
+            check_origin(&parts.headers)?;
         }
         let id = cookie_token(&parts.headers).ok_or_else(ApiError::unauthorized)?;
         web.sessions
@@ -338,12 +338,11 @@ async fn register(
         .lock()
         .map_err(|_| ApiError::worker())?
         .insert(employee);
-    let secure = if web.secure_cookie { "; Secure" } else { "" };
     let mut response = employee.response();
     response.headers_mut().insert(
         header::SET_COOKIE,
         HeaderValue::from_str(&format!(
-            "{COOKIE}={id}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}{secure}",
+            "{COOKIE}={id}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}",
             SESSION_TTL.as_secs()
         ))
         .expect("cookie contains only static attributes and a generated identifier"),
@@ -557,6 +556,29 @@ async fn operation_status(
         })
         .await?;
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(status)))
+}
+
+async fn recent_employees(State(web): State<Arc<Web>>) -> Result<impl IntoResponse, ApiError> {
+    let employees = web
+        .blocking(|web| web.audit.recent_employees().map_err(|_| ApiError::audit()))
+        .await?;
+    Ok(([(header::CACHE_CONTROL, "no-store")], Json(employees)))
+}
+
+async fn employee_activity(
+    State(web): State<Arc<Web>>,
+    employee: Result<Path<String>, PathRejection>,
+) -> Result<impl IntoResponse, ApiError> {
+    let Path(employee) = employee.map_err(|_| ApiError::invalid("invalid employee number"))?;
+    let employee = Employee::parse(&employee)?;
+    let activity = web
+        .blocking(move |web| {
+            web.audit
+                .employee_activity(employee.as_str(), &web.catalog)
+                .map_err(|_| ApiError::audit())
+        })
+        .await?;
+    Ok(([(header::CACHE_CONTROL, "no-store")], Json(activity)))
 }
 
 async fn run_search(

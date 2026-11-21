@@ -1,164 +1,271 @@
 use std::{
-    fmt,
-    fs::{self, File, Metadata},
-    io::{self, Read},
+    ffi::OsString,
+    io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    path::Path,
+    num::NonZeroUsize,
+    path::PathBuf,
 };
 
 use reqwest::{Url, header::HeaderValue};
-use serde::Deserialize;
 
-use crate::model_http::ApiConfig;
+use crate::{model_http::ApiConfig, search::FusionMode};
 
-#[derive(Deserialize)]
-#[serde(default, deny_unknown_fields)]
+const DEFAULT_LISTEN: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 9333);
+
+pub(crate) const HELP: &str = "\
+Rust Knowledge Server：从 Web 导入 Markdown，通过 Web 和只读 MCP 搜索。
+
+用法：
+  rust-knowledge-server [选项]
+  rust-knowledge-server --edge-probe <write|read> <目录>
+
+启动选项（不读取服务配置文件）：
+  -h, --help                 显示本帮助并退出
+  --listen <IP:PORT>         HTTP 监听；默认 0.0.0.0:9333（所有 IPv4 接口），IPv6 可用 [::]:9333
+  --mcp-origin <ORIGIN>      允许的 MCP HTTP(S) 来源，不带路径，可重复；默认不允许携带 Origin
+                             不发送 Origin 的客户端仍可连接，但必须匹配 Host
+  --fusion <grouped|edge>    混合检索方式；默认 grouped（先分组再融合）
+                             edge 使用原生 RRF 后分组；切换不需要重导
+
+固定数据目录：
+  Windows x64：~/.rust-knowledge-server（本地磁盘，机器重启后保留）
+  CentOS 7 x64：/dev/shm/rust-knowledge-server（tmpfs，无需 root）
+               进程重启可复用，机器重启后清空；请自行保管 Markdown 并重新导入。
+  同一目录只能由一个进程使用。
+
+模型选项（均默认关闭，支持 HTTP(S) API，互不依赖）：
+  --embedding-url <URL>         Embedding API 基址，可带 /v1
+  --embedding-model <NAME>      Embedding 模型名
+  --embedding-dimensions <N>    正整数，须与模型维度相同；启用时前三项必填
+  --embedding-api-key <KEY>     可选 Bearer 密钥
+  --rerank-url <URL>             Rerank API 基址，可带 /v1
+  --rerank-model <NAME>          Rerank 模型名；启用时 URL 与模型名均必填
+  --rerank-api-key <KEY>        可选 Bearer 密钥
+  启用或更换 Embedding 后，从原始 Markdown 重导以生成兼容向量。
+  密钥作为命令行参数可能被进程列表或 shell 历史记录看到。
+
+如何使用：
+  本机：直接启动，打开 http://127.0.0.1:9333；登记 8 位数字工号后建库、导入
+        UTF-8 .md 文件，再在「测试搜索」查询。重导会整库替换。
+  远程访问：默认可用 http://<服务IP>:9333。服务不验证身份，请用防火墙限制可访问的机器。
+        仅本机使用时，指定 --listen 127.0.0.1:9333。
+  Claude Code：claude mcp add --transport http knowledge http://127.0.0.1:9333/mcp
+  OMP：运行 /mcp add，选择 HTTP，填同一个 /mcp 地址；已预置地址的构建可直接用。
+  MCP 只读且无需登记工号；连接共享实例时使用管理员提供的 /mcp 地址。
+  --edge-probe：write 写入测试索引，read 验证重开；使用单独的测试目录。
+";
+
+#[cfg(target_os = "linux")]
+pub(crate) const DAEMON_HELP: &str = "
+
+CentOS 7 后台管理（无需 root）：
+  rust-knowledge-server start [启动选项]  后台启动，监听就绪后返回
+  rust-knowledge-server status           查看后台实例的 PID 和监听地址
+  rust-knowledge-server stop             正常停机并等待收尾
+  直接运行仍为前台模式；后台日志：/dev/shm/rust-knowledge-server/daemon.log。
+  不负责异常退出后拉起或开机自启。
+";
+
+#[cfg(target_os = "linux")]
+pub(crate) const DAEMON_CHILD: &str = "__daemon";
+
+pub(crate) enum Command {
+    Help,
+    Probe {
+        mode: &'static str,
+        directory: PathBuf,
+    },
+    Serve(Settings),
+    #[cfg(target_os = "linux")]
+    Start,
+    #[cfg(target_os = "linux")]
+    Status,
+    #[cfg(target_os = "linux")]
+    Stop,
+    #[cfg(target_os = "linux")]
+    Daemon(Settings),
+}
+
 pub(crate) struct Settings {
     pub(crate) listen: SocketAddr,
-    pub(crate) web_origin: Option<String>,
-    pub(crate) mcp_hosts: Vec<String>,
     pub(crate) mcp_origins: Vec<String>,
     pub(crate) embedding: Option<EmbeddingSettings>,
     pub(crate) rerank: Option<ApiConfig>,
+    pub(crate) fusion: FusionMode,
 }
 
-#[derive(Deserialize)]
 pub(crate) struct EmbeddingSettings {
-    #[serde(flatten)]
     pub(crate) api: ApiConfig,
     pub(crate) dimensions: usize,
 }
 
-impl Default for Settings {
-    fn default() -> Self {
-        Self {
-            listen: SocketAddr::from((Ipv4Addr::LOCALHOST, 7336)),
-            web_origin: None,
-            // Bracketed authority and bare ::1 match the same IPv6 host in rmcp.
-            mcp_hosts: ["localhost", "127.0.0.1", "[::1]"].map(String::from).into(),
-            mcp_origins: Vec::new(),
-            embedding: None,
-            rerank: None,
+#[derive(Default)]
+struct ModelArgs {
+    url: Option<String>,
+    name: Option<String>,
+    key: Option<String>,
+}
+
+impl ModelArgs {
+    fn finish(self, flags: &str, required: bool) -> io::Result<Option<ApiConfig>> {
+        match (self.url, self.name, self.key) {
+            (None, None, None) if !required => Ok(None),
+            (Some(base_url), Some(model), api_key) => Ok(Some(ApiConfig {
+                base_url,
+                model,
+                api_key,
+            })),
+            _ => Err(invalid(flags, "URL and model name are required together")),
         }
     }
 }
 
-#[derive(Debug)]
-pub(crate) enum SettingsError {
-    Read(io::ErrorKind),
-    NotRegularFile,
-    Json {
-        line: usize,
-        column: usize,
-    },
-    Invalid {
-        field: &'static str,
-        reason: &'static str,
-    },
-}
-
-impl fmt::Display for SettingsError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Read(kind) => write!(f, "cannot read config.json: {kind}"),
-            Self::NotRegularFile => {
-                f.write_str("config.json must be a regular file, not a symlink or reparse point")
-            }
-            Self::Json { line, column } => {
-                write!(f, "invalid config.json at line {line}, column {column}")
-            }
-            Self::Invalid { field, reason } => write!(f, "invalid config.json {field}: {reason}"),
-        }
-    }
-}
-
-impl std::error::Error for SettingsError {}
-
-impl From<io::Error> for SettingsError {
-    fn from(error: io::Error) -> Self {
-        Self::Read(error.kind())
-    }
-}
-
-pub(crate) fn read(root: &Path) -> Result<Settings, SettingsError> {
-    let path = root.join("config.json");
-    match fs::symlink_metadata(&path) {
-        Ok(metadata) => require_regular_file(&metadata)?,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Settings::default()),
-        Err(error) => return Err(error.into()),
-    }
-
-    let mut file = open_direct(&path)?;
-    require_regular_file(&file.metadata()?)?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
-    let mut settings: Settings = serde_json::from_slice(&bytes).map_err(|error| {
-        // Serde messages can include unexpected keys or values, including secrets.
-        SettingsError::Json {
-            line: error.line(),
-            column: error.column(),
-        }
-    })?;
-
-    settings.web_origin = settings
-        .web_origin
-        .as_deref()
-        .map(|value| canonical_origin(value, "web_origin"))
-        .transpose()?;
-    for origin in &mut settings.mcp_origins {
-        *origin = canonical_origin(origin, "mcp_origins")?;
-    }
-    if settings.mcp_hosts.is_empty() {
-        return Err(invalid("mcp_hosts", "must contain at least one host"));
-    }
-    for authority in &settings.mcp_hosts {
-        let Some(host) = parse_host(authority, true) else {
-            return Err(invalid(
-                "mcp_hosts",
-                "each entry must be a literal hostname or IP address with an optional numeric port; bracket IPv6 addresses with ports",
-            ));
-        };
-        if matches!(host, Host::Ip(ip) if ip.to_canonical().is_unspecified()) {
-            return Err(invalid(
-                "mcp_hosts",
-                "unspecified IP addresses are not allowed",
-            ));
-        }
-    }
-    Ok(settings)
-}
-
-impl Settings {
-    /// Check the effective address after applying any command-line override.
-    pub(crate) fn validate_listen(&self, address: SocketAddr) -> Result<(), SettingsError> {
-        if address.ip().to_canonical().is_loopback() {
-            return Ok(());
-        }
-        if self.web_origin.is_none() {
-            return Err(invalid(
-                "web_origin",
-                "required for a non-loopback listen address",
-            ));
-        }
-        if !self
-            .mcp_hosts
-            .iter()
-            .any(|authority| parse_host(authority, true).is_some_and(|host| !host.is_loopback()))
+pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> io::Result<Command> {
+    let mut args = args.into_iter().peekable();
+    if args.peek().is_some_and(|arg| arg == "--edge-probe") {
+        args.next();
+        if args
+            .peek()
+            .is_some_and(|arg| arg == "--help" || arg == "-h")
         {
-            return Err(invalid(
-                "mcp_hosts",
-                "at least one non-loopback host is required for a non-loopback listen address",
-            ));
+            return Ok(Command::Help);
         }
-        Ok(())
+        let mode = match value(&mut args, "--edge-probe")?.to_str() {
+            Some("write") => "write",
+            Some("read") => "read",
+            _ => return Err(invalid("--edge-probe", "expected write or read")),
+        };
+        let directory = value(&mut args, "--edge-probe")?.into();
+        if args.next().is_some() {
+            return Err(invalid("--edge-probe", "unexpected argument"));
+        }
+        return Ok(Command::Probe { mode, directory });
     }
+    #[cfg(target_os = "linux")]
+    let daemon_command = match args.peek().and_then(|arg| arg.to_str()) {
+        Some("start") => Some(false),
+        Some(DAEMON_CHILD) => Some(true),
+        Some("status" | "stop") => {
+            let command = if args.next().is_some_and(|arg| arg == "status") {
+                Command::Status
+            } else {
+                Command::Stop
+            };
+            return match args.next() {
+                None => Ok(command),
+                Some(arg) if (arg == "--help" || arg == "-h") && args.next().is_none() => {
+                    Ok(Command::Help)
+                }
+                _ => Err(invalid(
+                    "arguments",
+                    "status and stop take no startup options",
+                )),
+            };
+        }
+        _ => None,
+    };
+    #[cfg(target_os = "linux")]
+    if daemon_command.is_some() {
+        args.next();
+    }
+
+    let (mut listen, mut fusion, mut dimensions) = (None, None, None);
+    let mut mcp_origins = Vec::new();
+    let (mut embedding, mut rerank) = (ModelArgs::default(), ModelArgs::default());
+    while let Some(option) = args.next() {
+        let unknown = || invalid("arguments", "unknown option or unexpected argument");
+        let flag = option.to_str().ok_or_else(unknown)?;
+        let mut text = || {
+            value(&mut args, flag)?
+                .into_string()
+                .map_err(|_| invalid(flag, "value must be valid Unicode"))
+        };
+        match flag {
+            "-h" | "--help" => return Ok(Command::Help),
+            "--listen" => set_once(
+                &mut listen,
+                text()?
+                    .parse()
+                    .map_err(|_| invalid(flag, "requires an IP address and port"))?,
+                flag,
+            )?,
+            "--mcp-origin" => mcp_origins.push(canonical_origin(&text()?, flag)?),
+            "--fusion" => set_once(
+                &mut fusion,
+                match text()?.as_str() {
+                    "grouped" => FusionMode::Grouped,
+                    "edge" => FusionMode::Edge,
+                    _ => return Err(invalid(flag, "expected grouped or edge")),
+                },
+                flag,
+            )?,
+            "--embedding-url" => set_once(&mut embedding.url, text()?, flag)?,
+            "--embedding-model" => set_once(&mut embedding.name, text()?, flag)?,
+            "--embedding-api-key" => set_once(&mut embedding.key, text()?, flag)?,
+            "--embedding-dimensions" => set_once(
+                &mut dimensions,
+                text()?
+                    .parse::<NonZeroUsize>()
+                    .map_err(|_| invalid(flag, "requires a positive integer"))?
+                    .get(),
+                flag,
+            )?,
+            "--rerank-url" => set_once(&mut rerank.url, text()?, flag)?,
+            "--rerank-model" => set_once(&mut rerank.name, text()?, flag)?,
+            "--rerank-api-key" => set_once(&mut rerank.key, text()?, flag)?,
+            _ => return Err(unknown()),
+        }
+    }
+    let listen = listen.unwrap_or(DEFAULT_LISTEN);
+    let embedding = embedding
+        .finish("--embedding-url / --embedding-model", dimensions.is_some())?
+        .map(|api| {
+            let dimensions = dimensions.ok_or_else(|| {
+                invalid(
+                    "--embedding-dimensions",
+                    "required when Embedding is enabled",
+                )
+            })?;
+            Ok::<_, io::Error>(EmbeddingSettings { api, dimensions })
+        })
+        .transpose()?;
+    let settings = Settings {
+        listen,
+        mcp_origins,
+        embedding,
+        rerank: rerank.finish("--rerank-url / --rerank-model", false)?,
+        fusion: fusion.unwrap_or_default(),
+    };
+    #[cfg(target_os = "linux")]
+    if let Some(child) = daemon_command {
+        return Ok(if child {
+            Command::Daemon(settings)
+        } else {
+            Command::Start
+        });
+    }
+    Ok(Command::Serve(settings))
 }
 
-fn invalid(field: &'static str, reason: &'static str) -> SettingsError {
-    SettingsError::Invalid { field, reason }
+fn value(args: &mut impl Iterator<Item = OsString>, flag: &str) -> io::Result<OsString> {
+    args.next()
+        .filter(|value| !value.is_empty() && !value.as_encoded_bytes().starts_with(b"--"))
+        .ok_or_else(|| invalid(flag, "missing value"))
 }
 
-pub(crate) fn canonical_origin(value: &str, field: &'static str) -> Result<String, SettingsError> {
+fn set_once<T>(slot: &mut Option<T>, value: T, flag: &str) -> io::Result<()> {
+    if slot.is_some() {
+        return Err(invalid(flag, "may only be specified once"));
+    }
+    *slot = Some(value);
+    Ok(())
+}
+
+fn invalid(field: &str, reason: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, format!("{field}: {reason}"))
+}
+
+fn canonical_origin(value: &str, field: &str) -> io::Result<String> {
     let Some((scheme, authority)) = value.split_once("://") else {
         return Err(invalid(field, "must be an explicit HTTP or HTTPS origin"));
     };
@@ -171,7 +278,7 @@ pub(crate) fn canonical_origin(value: &str, field: &'static str) -> Result<Strin
     if authority.contains(['/', '\\', '?', '#']) {
         return Err(invalid(field, "path, query, and fragment are not allowed"));
     }
-    if parse_host(authority, false).is_none() {
+    if HttpAuthority::parse(authority).is_none() {
         return Err(invalid(field, "invalid host or port"));
     }
     let origin = Url::parse(value)
@@ -187,41 +294,61 @@ enum Host<'a> {
     Dns(&'a str),
 }
 
-impl Host<'_> {
-    fn is_loopback(&self) -> bool {
-        match self {
-            Self::Ip(ip) => ip.to_canonical().is_loopback(),
-            Self::Dns(name) => {
-                name.eq_ignore_ascii_case("localhost")
-                    || name
-                        .rsplit_once('.')
-                        .is_some_and(|(_, suffix)| suffix.eq_ignore_ascii_case("localhost"))
+pub(crate) struct HttpAuthority<'a> {
+    host: Host<'a>,
+    port: Option<u16>,
+}
+
+impl<'a> HttpAuthority<'a> {
+    pub(crate) fn parse(authority: &'a str) -> Option<Self> {
+        let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
+            let (host, tail) = bracketed.split_once(']')?;
+            let port = if tail.is_empty() {
+                None
+            } else {
+                Some(parse_port(tail.strip_prefix(':')?)?)
+            };
+            (Host::Ip(host.parse::<Ipv6Addr>().ok()?.into()), port)
+        } else {
+            let (host, port) = match authority.split_once(':') {
+                Some((host, port)) => (host, Some(parse_port(port)?)),
+                None => (authority, None),
+            };
+            (parse_ipv4_or_dns(host)?, port)
+        };
+        Some(Self { host, port })
+    }
+
+    pub(crate) fn matches_socket(&self, local: SocketAddr, peer_is_loopback: bool) -> bool {
+        self.http_port() == local.port()
+            && match self.host {
+                Host::Ip(ip) => ip.to_canonical() == local.ip().to_canonical(),
+                Host::Dns(name) => {
+                    peer_is_loopback
+                        && local.ip().to_canonical().is_loopback()
+                        && name.eq_ignore_ascii_case("localhost")
+                }
             }
+    }
+
+    pub(crate) fn same_http_endpoint(&self, other: &Self) -> bool {
+        self.same_host(other) && self.http_port() == other.http_port()
+    }
+
+    fn http_port(&self) -> u16 {
+        self.port.unwrap_or(80)
+    }
+
+    fn same_host(&self, other: &Self) -> bool {
+        match (&self.host, &other.host) {
+            (Host::Ip(a), Host::Ip(b)) => a == b,
+            (Host::Dns(a), Host::Dns(b)) => a.eq_ignore_ascii_case(b),
+            _ => false,
         }
     }
 }
 
-fn parse_host(authority: &str, allow_bare_ipv6: bool) -> Option<Host<'_>> {
-    if let Some(bracketed) = authority.strip_prefix('[') {
-        let (host, tail) = bracketed.split_once(']')?;
-        if !tail.is_empty() && !valid_port(tail.strip_prefix(':')?) {
-            return None;
-        }
-        return Some(Host::Ip(host.parse::<Ipv6Addr>().ok()?.into()));
-    }
-    // rmcp 3.11.0 treats a bare IPv6 literal (including its default ::1) as
-    // host-only and strips brackets from parsed HTTP request authorities.
-    if allow_bare_ipv6 && let Ok(ip) = authority.parse::<Ipv6Addr>() {
-        return Some(Host::Ip(ip.into()));
-    }
-    let host = if let Some((host, port)) = authority.split_once(':') {
-        if !valid_port(port) {
-            return None;
-        }
-        host
-    } else {
-        authority
-    };
+fn parse_ipv4_or_dns(host: &str) -> Option<Host<'_>> {
     if let Ok(ip) = host.parse::<Ipv4Addr>() {
         return Some(Host::Ip(ip.into()));
     }
@@ -247,50 +374,14 @@ fn parse_host(authority: &str, allow_bare_ipv6: bool) -> Option<Host<'_>> {
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
         }))
-    .then_some(Host::Dns(name))
+    .then_some(Host::Dns(host))
 }
 
-fn valid_port(port: &str) -> bool {
-    !port.is_empty()
-        && port.bytes().all(|byte| byte.is_ascii_digit())
-        && port.parse::<u16>().is_ok()
-}
-
-#[cfg(windows)]
-fn open_direct(path: &Path) -> io::Result<File> {
-    use std::os::windows::fs::OpenOptionsExt;
-    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
-
-    File::options()
-        .read(true)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)
-}
-
-#[cfg(target_os = "linux")]
-fn open_direct(path: &Path) -> io::Result<File> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    File::options()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-}
-
-fn require_regular_file(metadata: &Metadata) -> Result<(), SettingsError> {
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
-
-        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return Err(SettingsError::NotRegularFile);
-        }
+fn parse_port(port: &str) -> Option<u16> {
+    if port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
     }
-    if !metadata.is_file() || metadata.is_symlink() {
-        return Err(SettingsError::NotRegularFile);
-    }
-    Ok(())
+    port.parse().ok()
 }
 
 #[cfg(test)]
@@ -298,77 +389,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_and_explicit_settings() {
-        let dir = tempfile::tempdir().unwrap();
-        let settings = read(dir.path()).unwrap();
-        assert_eq!(
-            settings.listen,
-            "127.0.0.1:7336".parse::<SocketAddr>().unwrap()
-        );
-        assert!(settings.mcp_hosts.iter().any(|host| host == "[::1]"));
-        assert!(settings.mcp_origins.is_empty());
-        assert!(settings.web_origin.is_none());
-        let external = "0.0.0.0:7336".parse().unwrap();
-        assert!(settings.validate_listen(settings.listen).is_ok());
-        assert!(settings.validate_listen(external).is_err());
-
-        fs::write(
-            dir.path().join("config.json"),
-            r#"{
-                "web_origin": "HTTPS://knowledge.example:443",
-                "mcp_hosts": ["localhost", "[2001:db8::1]:7336"],
-                "mcp_origins": ["http://[::1]:80", "https://knowledge.example:7336"],
-                "embedding": {"base_url":"http://127.0.0.1:8000","model":"embed","dimensions":16},
-                "rerank": {"base_url":"http://127.0.0.1:8001","model":"rerank"}
-            }"#,
-        )
-        .unwrap();
-        let settings = read(dir.path()).unwrap();
-        assert!(settings.validate_listen(external).is_ok());
-        assert_eq!(
-            settings.web_origin.as_deref(),
-            Some("https://knowledge.example")
-        );
-        assert_eq!(
-            settings.mcp_origins,
-            ["http://[::1]", "https://knowledge.example:7336"]
-        );
-        let embedding = settings.embedding.unwrap();
-        assert_eq!(embedding.api.model, "embed");
-        assert_eq!(embedding.dimensions, 16);
-        assert_eq!(settings.rerank.unwrap().model, "rerank");
-    }
-
-    #[test]
-    fn invalid_config_errors_do_not_echo_values() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.json");
-        for content in [
-            br#"{"SECRET":"unknown field"}"#.as_slice(),
-            br#"{"mcp_hosts":["SECRET:*"]}"#,
-            br#"{"web_origin":"https://SECRET@example.com"}"#,
-            br#"{"mcp_origins":["https://example.com/SECRET"]}"#,
-            b"{\"web_origin\":\"SECRET\xff\"}",
+    fn invalid_arguments_do_not_echo_values_or_consume_the_next_option() {
+        for args in [
+            &["--SECRET"][..],
+            &["--mcp-host", "localhost"],
+            &["--mcp-origin", "https://SECRET@example.com"],
+            &["--rerank-api-key", "SECRET"],
+            &[
+                "--embedding-model",
+                "SECRET",
+                "--embedding-url",
+                "--fusion",
+                "edge",
+            ],
         ] {
-            fs::write(&path, content).unwrap();
-            let error = read(dir.path()).err().unwrap();
+            let Err(error) = parse(args.iter().map(OsString::from)) else {
+                panic!("invalid arguments were accepted");
+            };
             assert!(!error.to_string().contains("SECRET"));
-            assert!(!format!("{error:?}").contains("SECRET"));
         }
     }
 
     #[test]
-    fn authorities_are_unambiguous_and_loopback_is_not_external() {
+    fn rejects_ambiguous_http_authorities() {
         for authority in [
-            "localhost",
-            "team.localhost.:443",
-            "127.1.2.3",
             "::1",
-            "[::ffff:127.0.0.1]:80",
-        ] {
-            assert!(parse_host(authority, true).unwrap().is_loopback());
-        }
-        for authority in [
             "*",
             "localhost:*",
             "127.1",
@@ -377,7 +422,7 @@ mod tests {
             "host:80:81",
             "host/path",
         ] {
-            assert!(parse_host(authority, true).is_none());
+            assert!(HttpAuthority::parse(authority).is_none());
         }
     }
 }

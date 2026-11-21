@@ -7,13 +7,13 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use super::router;
-use crate::{catalog::Catalog, data_root::Root, search::FusionMode};
+use crate::{Connection, catalog::Catalog, data_root::Root, http_access, search::FusionMode};
 
 const INITIALIZE: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}"#;
 
-async fn initialize_status(addr: SocketAddr, path: &str, extra_headers: &str) -> u16 {
+async fn initialize_status(addr: SocketAddr, path: &str, host: &str, extra_headers: &str) -> u16 {
     let request = format!(
-        "POST {path} HTTP/1.1\r\nHost: knowledge.internal\r\n{extra_headers}\
+        "POST {path} HTTP/1.1\r\nHost: {host}\r\n{extra_headers}\
          Accept: application/json, text/event-stream\r\nContent-Type: application/json\r\n\
          Connection: close\r\nContent-Length: {}\r\n\r\n{INITIALIZE}",
         INITIALIZE.len(),
@@ -43,7 +43,6 @@ async fn exact_mcp_route_and_unambiguous_origin_and_host() {
         None,
         None,
         FusionMode::Grouped,
-        vec!["knowledge.internal".into()],
         vec!["https://client.internal".into()],
         cancellation.clone(),
     );
@@ -51,35 +50,39 @@ async fn exact_mcp_route_and_unambiguous_origin_and_host() {
     let addr = listener.local_addr().unwrap();
     let shutdown = cancellation.clone();
     let server = tokio::spawn(async move {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown.cancelled_owned())
-            .await
-            .unwrap();
+        axum::serve(
+            listener,
+            http_access(app).into_make_service_with_connect_info::<Connection>(),
+        )
+        .with_graceful_shutdown(shutdown.cancelled_owned())
+        .await
+        .unwrap();
     });
 
+    let host = addr.to_string();
+    let alias = format!("localhost:{}", addr.port());
     let allowed = "Origin: https://client.internal\r\n";
-    assert_eq!(initialize_status(addr, "/mcp", allowed).await, 200);
-    assert_eq!(initialize_status(addr, "/mcp/", allowed).await, 404);
-    assert_eq!(initialize_status(addr, "/mcp/extra", allowed).await, 404);
+    assert_eq!(initialize_status(addr, "/mcp", &host, allowed).await, 200);
+    assert_eq!(initialize_status(addr, "/mcp", &alias, "").await, 200);
+    assert_eq!(initialize_status(addr, "/mcp/", &host, allowed).await, 404);
     assert_eq!(
-        initialize_status(addr, "/mcp", "Origin: https://client.internal:8443\r\n").await,
-        403,
+        initialize_status(addr, "/mcp/extra", &host, allowed).await,
+        404
     );
+    for origin in [
+        "Origin: https://client.internal:8443\r\n",
+        "Origin: https://client.internal/path\r\n",
+        "Origin: https://client.internal\r\nOrigin: https://other.internal\r\n",
+    ] {
+        assert_eq!(initialize_status(addr, "/mcp", &host, origin).await, 403);
+    }
+    let wrong_ip = format!("127.0.0.2:{}", addr.port());
+    let wrong_port = format!("127.0.0.1:{}", addr.port().wrapping_add(1));
+    for wrong_host in [&wrong_ip, &wrong_port] {
+        assert_eq!(initialize_status(addr, "/mcp", wrong_host, "").await, 403);
+    }
     assert_eq!(
-        initialize_status(addr, "/mcp", "Origin: https://client.internal/path\r\n").await,
-        403,
-    );
-    assert_eq!(
-        initialize_status(
-            addr,
-            "/mcp",
-            &format!("{allowed}Origin: https://other.internal\r\n")
-        )
-        .await,
-        403,
-    );
-    assert_eq!(
-        initialize_status(addr, "/mcp", "Host: other.internal\r\n").await,
+        initialize_status(addr, "/mcp", &host, "Host: other.internal\r\n").await,
         400,
     );
 

@@ -11,9 +11,7 @@ use tokio::{
 };
 
 use super::*;
-use crate::data_root::Root;
-
-const ORIGIN: &str = "https://workbench.invalid";
+use crate::{Connection, data_root::Root, http_access};
 
 struct Fixture {
     client: Client,
@@ -33,12 +31,18 @@ impl Fixture {
             None,
             None,
             FusionMode::Grouped,
-            ORIGIN.into(),
             TaskTracker::new(),
         );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = format!("http://{}", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                http_access(app).into_make_service_with_connect_info::<Connection>(),
+            )
+            .await
+            .unwrap()
+        });
         Self {
             client: Client::builder().no_proxy().build().unwrap(),
             address,
@@ -55,7 +59,7 @@ impl Fixture {
         let response = self
             .client
             .post(self.url("/api/session"))
-            .header(header::ORIGIN, ORIGIN)
+            .header(header::ORIGIN, &self.address)
             .json(&json!({"employee": "00001234"}))
             .send()
             .await
@@ -67,12 +71,13 @@ impl Fixture {
             .unwrap()
             .to_str()
             .unwrap();
-        for flag in ["Path=/", "HttpOnly", "SameSite=Strict", "Secure"] {
+        for flag in ["Path=/", "HttpOnly", "SameSite=Strict"] {
             assert!(
                 cookie.split("; ").any(|part| part == flag),
                 "missing cookie flag {flag}"
             );
         }
+        assert!(!cookie.split("; ").any(|part| part == "Secure"));
         let token = cookie.split_once(';').unwrap().0.to_owned();
         assert_eq!(
             response.json::<Value>().await.unwrap(),
@@ -129,20 +134,58 @@ async fn origin_and_session_ambiguity_is_rejected_before_audit_begin() {
     assert_eq!(proxy_only.status(), StatusCode::FORBIDDEN);
     let duplicate_origin = create()
         .header(header::COOKIE, &cookie)
-        .header(header::ORIGIN, ORIGIN)
-        .header(header::ORIGIN, ORIGIN)
+        .header(header::ORIGIN, &fixture.address)
+        .header(header::ORIGIN, &fixture.address)
         .send()
         .await
         .unwrap();
     assert_eq!(duplicate_origin.status(), StatusCode::FORBIDDEN);
+    let port = fixture
+        .address
+        .rsplit_once(':')
+        .unwrap()
+        .1
+        .parse::<u16>()
+        .unwrap();
+    let wrong_port = port.wrapping_add(1);
+    let local = format!("localhost:{port}");
+    for (host, origin) in [
+        (
+            format!("unknown.test:{port}"),
+            format!("http://unknown.test:{port}"),
+        ),
+        (
+            format!("localhost:{wrong_port}"),
+            format!("http://localhost:{wrong_port}"),
+        ),
+        (local.clone(), format!("http://localhost:{wrong_port}")),
+        (local.clone(), format!("https://{local}")),
+    ] {
+        let response = create()
+            .header(header::COOKIE, &cookie)
+            .header(header::HOST, &host)
+            .header(header::ORIGIN, &origin)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{host}, {origin}");
+    }
     let duplicate_cookie = create()
-        .header(header::ORIGIN, ORIGIN)
+        .header(header::ORIGIN, &fixture.address)
         .header(header::COOKIE, format!("{cookie}; {cookie}"))
         .send()
         .await
         .unwrap();
     assert_eq!(duplicate_cookie.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(fixture.count_starts(), 0);
+    let response = create()
+        .header(header::COOKIE, &cookie)
+        .header(header::HOST, &local)
+        .header(header::ORIGIN, format!("http://{local}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
 }
 
 #[tokio::test]
@@ -152,7 +195,7 @@ async fn import_extraction_and_validation_do_not_publish_or_change_the_actor() {
     let created = fixture
         .client
         .post(fixture.url("/api/libraries"))
-        .header(header::ORIGIN, ORIGIN)
+        .header(header::ORIGIN, &fixture.address)
         .header(header::COOKIE, &cookie)
         .json(&json!({"name": ".."}))
         .send()
@@ -167,7 +210,7 @@ async fn import_extraction_and_validation_do_not_publish_or_change_the_actor() {
         fixture
             .client
             .post(fixture.url("/api/library/import?name=.."))
-            .header(header::ORIGIN, ORIGIN)
+            .header(header::ORIGIN, &fixture.address)
             .header(header::COOKIE, &cookie)
     };
     let malformed = upload()
@@ -212,7 +255,7 @@ async fn saturated_import_records_the_rejection_without_starting_a_build() {
     let response = fixture
         .client
         .post(fixture.url("/api/libraries"))
-        .header(header::ORIGIN, ORIGIN)
+        .header(header::ORIGIN, &fixture.address)
         .header(header::COOKIE, &cookie)
         .json(&json!({"name": "docs"}))
         .send()
@@ -230,7 +273,7 @@ async fn saturated_import_records_the_rejection_without_starting_a_build() {
             .write_all(
                 format!(
                     "POST /api/library/import?name=docs HTTP/1.1\r\nHost: {address}\r\n\
-             Origin: {ORIGIN}\r\nCookie: {cookie}\r\nContent-Length: 1000\r\n\
+             Origin: http://{address}\r\nCookie: {cookie}\r\nContent-Length: 1000\r\n\
              Content-Type: multipart/form-data; boundary=test-edge\r\n\r\n--test-edge\r\n"
                 )
                 .as_bytes(),
@@ -251,7 +294,7 @@ async fn saturated_import_records_the_rejection_without_starting_a_build() {
     let response = fixture
         .client
         .post(fixture.url("/api/library/import?name=docs"))
-        .header(header::ORIGIN, ORIGIN)
+        .header(header::ORIGIN, &fixture.address)
         .header(header::COOKIE, &cookie)
         .header(
             header::CONTENT_TYPE,
@@ -283,7 +326,7 @@ async fn name_at_the_utf8_limit_is_manageable_and_an_extra_byte_is_rejected() {
         let response = fixture
             .client
             .post(fixture.url("/api/libraries"))
-            .header(header::ORIGIN, ORIGIN)
+            .header(header::ORIGIN, &fixture.address)
             .header(header::COOKIE, &cookie)
             .json(&json!({"name": name}))
             .send()
@@ -294,7 +337,7 @@ async fn name_at_the_utf8_limit_is_manageable_and_an_extra_byte_is_rejected() {
     let response = fixture
         .client
         .delete(fixture.url("/api/library"))
-        .header(header::ORIGIN, ORIGIN)
+        .header(header::ORIGIN, &fixture.address)
         .header(header::COOKIE, &cookie)
         .query(&[("name", name)])
         .send()

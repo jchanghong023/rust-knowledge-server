@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, Metadata};
 use std::io::{self, BufReader};
 use std::path::{Path, PathBuf};
@@ -16,6 +16,7 @@ use crate::{
 const START: &str = "start.json";
 const RESULT: &str = "result.json";
 const REGISTRATION: &str = "registration.json";
+const RECENT_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
 
 type Active = Mutex<HashSet<Uuid>>;
 
@@ -73,11 +74,28 @@ pub(crate) struct OperationStatus {
 }
 
 #[derive(Serialize)]
-struct Registration<'a> {
+pub(crate) struct RecentEmployee {
+    employee: String,
+    last_registered_at_ms: u64,
+}
+
+#[derive(Serialize)]
+pub(crate) struct Activity {
+    #[serde(skip)]
     id: Uuid,
-    employee: &'a str,
+    action: Action,
+    library: Option<String>,
+    started_at_ms: u64,
+    outcome: Outcome,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Registration<S> {
+    id: Uuid,
+    employee: S,
     employee_self_reported: bool,
-    action: &'static str,
+    action: S,
     outcome: Outcome,
     timestamp_ms: u64,
 }
@@ -129,12 +147,8 @@ impl Audit {
             directory,
             active: Arc::default(),
         };
-        for entry in fs::read_dir(&audit.directory)? {
-            let entry = entry?;
-            let name = entry.file_name();
-            let Some(id) = name.to_str().and_then(start_id) else {
-                continue;
-            };
+        for id in audit.record_ids(START)? {
+            let id = id?;
             if audit.recover(id, catalog).is_err() {
                 warn_storage("could not reconcile an operation");
             }
@@ -219,33 +233,83 @@ impl Audit {
         }
     }
 
+    pub(crate) fn recent_employees(&self) -> io::Result<Vec<RecentEmployee>> {
+        self.recent_employees_at(now_ms())
+    }
+
+    fn recent_employees_at(&self, now: u64) -> io::Result<Vec<RecentEmployee>> {
+        let window = now.saturating_sub(RECENT_MS)..=now;
+        let mut employees = HashMap::<String, u64>::new();
+        for id in self.record_ids(REGISTRATION)? {
+            let id = id?;
+            let record: Registration<String> =
+                self.read(id, REGISTRATION)?.ok_or_else(invalid_record)?;
+            if record.id != id
+                || !record.employee_self_reported
+                || !valid_employee(&record.employee)
+                || record.action != "register"
+            {
+                return Err(invalid_record());
+            }
+            if record.outcome == Outcome::Succeeded && window.contains(&record.timestamp_ms) {
+                let latest = employees.entry(record.employee).or_default();
+                *latest = (*latest).max(record.timestamp_ms);
+            }
+        }
+        let mut employees: Vec<_> = employees
+            .into_iter()
+            .map(|(employee, last_registered_at_ms)| RecentEmployee {
+                employee,
+                last_registered_at_ms,
+            })
+            .collect();
+        employees.sort_unstable_by(|left, right| {
+            right
+                .last_registered_at_ms
+                .cmp(&left.last_registered_at_ms)
+                .then_with(|| left.employee.cmp(&right.employee))
+        });
+        Ok(employees)
+    }
+
+    pub(crate) fn employee_activity(
+        &self,
+        employee: &str,
+        catalog: &Catalog,
+    ) -> io::Result<Vec<Activity>> {
+        let mut activity = Vec::new();
+        for id in self.record_ids(START)? {
+            let id = id?;
+            let start = self.read_start(id)?.ok_or_else(invalid_record)?;
+            if start.employee == employee {
+                let outcome = self.operation_outcome(id, start.action, catalog)?;
+                activity.push(Activity {
+                    id,
+                    action: start.action,
+                    library: start.library,
+                    started_at_ms: start.started_at_ms,
+                    outcome,
+                });
+            }
+        }
+        activity.sort_unstable_by_key(|item| (std::cmp::Reverse(item.started_at_ms), item.id));
+        Ok(activity)
+    }
+
     pub(crate) fn status(
         &self,
         id: Uuid,
         catalog: &Catalog,
     ) -> io::Result<Option<OperationStatus>> {
-        // Serialize the evidence read with finish: callers may clear the receipt immediately
-        // after finish returns, so a poll must not miss both the receipt and result.
-        let active = lock_active(&self.active);
         let Some(start) = self.read_start(id)? else {
             return Ok(None);
         };
-        let commit = commit_evidence(catalog, id, start.action);
-        let outcome = if commit == CommitEvidence::Committed {
-            Outcome::Succeeded
-        } else if active.contains(&id) {
-            Outcome::InProgress
-        } else {
-            match self.read_result(id) {
-                Ok(Some(result)) => result.outcome,
-                Ok(None) if commit == CommitEvidence::NoCommit => Outcome::Interrupted,
-                Ok(None) => Outcome::Unknown,
-                Err(_) => {
-                    warn_storage("could not read an operation result");
-                    Outcome::Unknown
-                }
-            }
-        };
+        let outcome = self
+            .operation_outcome(id, start.action, catalog)
+            .unwrap_or_else(|_| {
+                warn_storage("could not read an operation result");
+                Outcome::Unknown
+            });
         Ok(Some(OperationStatus {
             id,
             employee: start.employee,
@@ -255,6 +319,51 @@ impl Audit {
             started_at_ms: start.started_at_ms,
             outcome,
         }))
+    }
+
+    fn operation_outcome(
+        &self,
+        id: Uuid,
+        action: Action,
+        catalog: &Catalog,
+    ) -> io::Result<Outcome> {
+        // Serialize the evidence read with finish: callers may clear the receipt immediately
+        // after finish returns, so a poll must not miss both the receipt and result.
+        let active = lock_active(&self.active);
+        let commit = commit_evidence(catalog, id, action);
+        if commit == CommitEvidence::Committed {
+            return Ok(Outcome::Succeeded);
+        }
+        if active.contains(&id) {
+            return Ok(Outcome::InProgress);
+        }
+        Ok(match self.read_result(id)? {
+            Some(result) => result.outcome,
+            None if commit == CommitEvidence::NoCommit => Outcome::Interrupted,
+            None => Outcome::Unknown,
+        })
+    }
+
+    fn record_ids(
+        &self,
+        suffix: &'static str,
+    ) -> io::Result<impl Iterator<Item = io::Result<Uuid>> + use<>> {
+        check_directory(&self.directory)?;
+        Ok(
+            fs::read_dir(&self.directory)?.filter_map(move |entry| match entry {
+                Ok(entry) => {
+                    let name = entry.file_name();
+                    let (id, kind) = name.to_str()?.split_once('.')?;
+                    if kind != suffix {
+                        return None;
+                    }
+                    let uuid = Uuid::parse_str(id).ok()?;
+                    (uuid.hyphenated().encode_lower(&mut Uuid::encode_buffer()) == id)
+                        .then_some(Ok(uuid))
+                }
+                Err(error) => Some(Err(error)),
+            }),
+        )
     }
 
     fn recover(&self, id: Uuid, catalog: &Catalog) -> io::Result<()> {
@@ -380,12 +489,6 @@ fn check_employee(employee: &str) -> io::Result<()> {
             "employee must contain exactly eight ASCII digits",
         ))
     }
-}
-
-fn start_id(name: &str) -> Option<Uuid> {
-    let uuid = name.strip_suffix(".start.json")?;
-    let id = Uuid::parse_str(uuid).ok()?;
-    (id.hyphenated().encode_lower(&mut Uuid::encode_buffer()) == uuid).then_some(id)
 }
 
 fn commit_evidence(catalog: &Catalog, id: Uuid, action: Action) -> CommitEvidence {

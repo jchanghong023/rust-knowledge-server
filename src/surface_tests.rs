@@ -15,9 +15,11 @@ use tokio::{net::TcpListener, task::JoinHandle, time};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use crate::{
+    Connection,
     audit::Audit,
     catalog::Catalog,
     data_root::Root,
+    http_access,
     index::EMBEDDING_GENERATION,
     mcp,
     model_http::{ApiConfig, Embedding, Rerank},
@@ -30,7 +32,6 @@ const LIBRARY: &str = "manual";
 const SOURCE_PATH: &str = "guide/nested/Example.MD";
 const SOURCE: &str =
     "\u{feff}# Example\r\n```cpp\r\n# not a heading\r\nstd::vector mystic;\r\n```\r\n";
-const MCP_HOST: &str = "knowledge.test";
 const MCP_VERSION: &str = "2025-11-25";
 const MCP_ACCEPT: &str = "application/json, text/event-stream";
 const FOREIGN_ORIGIN: &str = "https://other.test";
@@ -47,10 +48,13 @@ impl Loopback {
         let address: SocketAddr = listener.local_addr().unwrap();
         let task_shutdown = shutdown.clone();
         let task = tokio::spawn(async move {
-            axum::serve(listener, app)
-                .with_graceful_shutdown(task_shutdown.cancelled_owned())
-                .await
-                .unwrap();
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<Connection>(),
+            )
+            .with_graceful_shutdown(task_shutdown.cancelled_owned())
+            .await
+            .unwrap();
         });
         Self {
             origin: format!("http://{address}"),
@@ -93,7 +97,6 @@ impl Service {
         let audit = Arc::new(Audit::open(catalog.root_path(), &catalog).unwrap());
         let imports = TaskTracker::new();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let origin = format!("http://{}", listener.local_addr().unwrap());
         let shutdown = CancellationToken::new();
         let app = web::router(
             catalog.clone(),
@@ -101,7 +104,6 @@ impl Service {
             embedding.clone(),
             rerank.clone(),
             fusion,
-            origin,
             imports.clone(),
         )
         .merge(mcp::router(
@@ -109,11 +111,10 @@ impl Service {
             embedding,
             rerank,
             fusion,
-            vec![MCP_HOST.to_owned()],
             Vec::new(),
             shutdown.clone(),
         ));
-        let server = Loopback::spawn(listener, app, shutdown);
+        let server = Loopback::spawn(listener, http_access(app), shutdown);
         let client = Client::builder()
             .http1_only()
             .no_proxy()
@@ -336,7 +337,6 @@ async fn web_error(response: Response, status: StatusCode, code: &str) -> Value 
 fn mcp_request(service: &Service) -> RequestBuilder {
     service
         .request(Method::POST, "/mcp")
-        .header(header::HOST, MCP_HOST)
         .header(header::ACCEPT, MCP_ACCEPT)
 }
 

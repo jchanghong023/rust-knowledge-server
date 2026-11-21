@@ -14,7 +14,10 @@
         <h1>知识库工作台</h1>
         <p>管理共享 Markdown 文档，检索并核对原文。</p>
       </div>
-      <p id="current-employee" class="identity" hidden></p>
+      <div class="masthead-actions">
+        <a id="activity-link" href="#activity">活动记录</a>
+        <p id="current-employee" class="identity" hidden></p>
+      </div>
     </div>
   </header>
   <main class="page">
@@ -23,7 +26,7 @@
 
     <section id="registration" class="panel registration" aria-labelledby="registration-title" hidden>
       <h2 id="registration-title">登记工号</h2>
-      <p id="registration-help">工号由你自行填写，仅用于操作留痕，不验证身份。所有已登记人员的权限相同。</p>
+      <p id="registration-help">工号由你自行填写，不验证身份。能访问本网页的人均可查看登记工号和知识库操作记录。</p>
       <form id="registration-form">
         <label for="employee">工号</label>
         <input id="employee" name="employee" type="text" inputmode="numeric" pattern="[0-9]{8}"
@@ -113,6 +116,14 @@
         </section>
       </section>
     </div>
+
+    <details id="activity" class="panel activity">
+      <summary><h2>活动记录</h2></summary>
+      <p class="hint">以下为最近 30 天成功登记的自报工号，不代表已验证身份或当前在线。展开工号可查看其仍保留的知识库操作。</p>
+      <button id="refresh-activity" type="button">刷新记录</button>
+      <p id="activity-status" class="message" role="status"></p>
+      <ul id="activity-roster" aria-label="最近 30 天登记工号"></ul>
+    </details>
   </main>
 
   <dialog id="confirmation" aria-labelledby="confirmation-title" aria-describedby="confirmation-message">

@@ -1,5 +1,7 @@
 mod audit;
 mod catalog;
+#[cfg(target_os = "linux")]
+mod daemon;
 mod data_root;
 mod durable;
 mod edge_probe;
@@ -16,18 +18,28 @@ mod surface_tests;
 mod technical;
 mod web;
 
-use std::{
-    env, error::Error, ffi::OsStr, future::Future, io, net::SocketAddr, path::Path,
-    process::ExitCode, sync::Arc,
-};
+use std::{env, error::Error, future::Future, io, net::SocketAddr, process::ExitCode, sync::Arc};
 
-use axum::{Router, http::header, response::Html, routing::get};
+use axum::{
+    Router,
+    extract::{ConnectInfo, Request, connect_info::Connected},
+    http::{StatusCode, header},
+    middleware::{self, Next},
+    response::{Html, IntoResponse, Response},
+    routing::get,
+    serve::IncomingStream,
+};
 use tokio::net::TcpListener;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
-use search::FusionMode;
+use settings::{Command, HttpAuthority, Settings};
 
-const USAGE: &str = "Usage: rust-knowledge-server [--listen <SocketAddr>] [--fusion <grouped|edge>]\n       rust-knowledge-server --edge-probe <write|read> <directory>";
+#[derive(Clone, Copy)]
+enum RunMode {
+    Foreground,
+    #[cfg(target_os = "linux")]
+    Daemon,
+}
 
 fn main() -> ExitCode {
     match run() {
@@ -40,95 +52,62 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), Box<dyn Error>> {
-    let mut args = env::args_os().skip(1).peekable();
-    if args.peek().is_some_and(|flag| flag == "--edge-probe") {
-        args.next();
-        let mode = args.next();
-        let mode = match mode.as_deref().and_then(OsStr::to_str) {
-            Some(mode @ ("write" | "read")) => mode,
-            _ => return Err(usage_error("--edge-probe requires mode write or read").into()),
-        };
-        let directory = args
-            .next()
-            .filter(|directory| !directory.is_empty())
-            .ok_or("--edge-probe requires a directory path")
-            .map_err(usage_error)?;
-        if args.next().is_some() {
-            return Err(
-                usage_error("unexpected argument after --edge-probe <mode> <directory>").into(),
-            );
+    match settings::parse(env::args_os().skip(1)) {
+        Ok(Command::Help) => {
+            print!("{}", settings::HELP);
+            #[cfg(target_os = "linux")]
+            print!("{}", settings::DAEMON_HELP);
+            Ok(())
         }
-        return edge_probe::run(mode, Path::new(&directory));
-    }
-    let mut address = None;
-    let mut fusion = None;
-    while let Some(flag) = args.next() {
-        match flag.to_str() {
-            Some("--listen") if address.is_none() => {
-                address = Some(
-                    args.next()
-                        .as_deref()
-                        .and_then(OsStr::to_str)
-                        .and_then(|address| address.parse::<SocketAddr>().ok())
-                        .ok_or_else(|| {
-                            usage_error(
-                                "--listen requires an IP address and port, e.g. 127.0.0.1:7336",
-                            )
-                        })?,
-                );
+        Ok(Command::Probe { mode, directory }) => edge_probe::run(mode, &directory),
+        Ok(Command::Serve(settings)) => serve_http(settings, RunMode::Foreground),
+        #[cfg(target_os = "linux")]
+        Ok(Command::Start) => Ok(daemon::start()?),
+        #[cfg(target_os = "linux")]
+        Ok(Command::Status) => Ok(daemon::status()?),
+        #[cfg(target_os = "linux")]
+        Ok(Command::Stop) => Ok(daemon::stop()?),
+        #[cfg(target_os = "linux")]
+        Ok(Command::Daemon(settings)) => {
+            let result = serve_http(settings, RunMode::Daemon);
+            if let Err(error) = &result {
+                daemon::report_start_error(error.as_ref());
             }
-            Some("--fusion") if fusion.is_none() => {
-                fusion = Some(match args.next().as_deref().and_then(OsStr::to_str) {
-                    Some("grouped") => FusionMode::Grouped,
-                    Some("edge") => FusionMode::Edge,
-                    _ => return Err(usage_error("--fusion requires grouped or edge").into()),
-                });
-            }
-            Some("--listen" | "--fusion") => {
-                return Err(usage_error(&format!("duplicate argument {flag:?}")).into());
-            }
-            _ => return Err(usage_error(&format!("unknown argument {flag:?}")).into()),
+            result
         }
+        Err(error) => Err(format!("{error}\nRun rust-knowledge-server --help for usage.").into()),
     }
-    serve_http(address, fusion.unwrap_or_default())
 }
 
-fn usage_error(message: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidInput, format!("{message}\n{USAGE}"))
-}
-
-fn serve_http(
-    override_address: Option<SocketAddr>,
-    fusion: FusionMode,
-) -> Result<(), Box<dyn Error>> {
-    let root = data_root::Root::open_from_env()?;
-    let settings = settings::read(root.path())?;
-    let address = override_address.unwrap_or(settings.listen);
-    settings.validate_listen(address)?;
-    let catalog = Arc::new(catalog::Catalog::open(root)?);
-    let audit = Arc::new(audit::Audit::open(catalog.root_path(), &catalog)?);
+fn serve_http(settings: Settings, mode: RunMode) -> Result<(), Box<dyn Error>> {
     tokio::runtime::Builder::new_multi_thread()
         .max_blocking_threads(8)
         .enable_all()
         .build()?
-        .block_on(serve(address, settings, catalog, audit, fusion))
+        .block_on(serve(settings, mode))
 }
 
-async fn serve(
-    address: SocketAddr,
-    settings: settings::Settings,
-    catalog: Arc<catalog::Catalog>,
-    audit: Arc<audit::Audit>,
-    fusion: FusionMode,
-) -> Result<(), Box<dyn Error>> {
-    let embedding = settings
-        .embedding
+async fn serve(settings: Settings, mode: RunMode) -> Result<(), Box<dyn Error>> {
+    let Settings {
+        listen: address,
+        mcp_origins,
+        embedding,
+        rerank,
+        fusion,
+    } = settings;
+    let embedding = embedding
         .map(|value| model_http::Embedding::new(value.api, value.dimensions).map(Arc::new))
         .transpose()?;
-    let rerank = settings
-        .rerank
+    let rerank = rerank
         .map(|value| model_http::Rerank::new(value).map(Arc::new))
         .transpose()?;
+    let root = data_root::Root::open_default()?;
+    #[cfg(target_os = "linux")]
+    if matches!(mode, RunMode::Daemon) {
+        daemon::redirect_log(root.path())?;
+    }
+    let catalog = Arc::new(catalog::Catalog::open(root)?);
+    let audit = Arc::new(audit::Audit::open(catalog.root_path(), &catalog)?);
     let shutdown = shutdown_signal().map_err(|error| {
         io::Error::new(
             error.kind(),
@@ -141,11 +120,7 @@ async fn serve(
             format!("could not bind HTTP listener to {address}: {error}"),
         )
     })?;
-    let local_url = format!("http://{}", listener.local_addr()?);
-    let origin = match settings.web_origin {
-        Some(origin) => origin,
-        None => settings::canonical_origin(&local_url, "web_origin")?,
-    };
+    let bound = listener.local_addr()?;
     let jobs = TaskTracker::new();
     let cancellation = CancellationToken::new();
     let app = Router::new()
@@ -158,7 +133,6 @@ async fn serve(
             embedding.clone(),
             rerank.clone(),
             fusion,
-            origin,
             jobs.clone(),
         ))
         .merge(mcp::router(
@@ -166,23 +140,107 @@ async fn serve(
             embedding,
             rerank,
             fusion,
-            settings.mcp_hosts,
-            settings.mcp_origins,
+            mcp_origins,
             cancellation.clone(),
         ));
-    println!("Data root: {}", catalog.root_path().display());
-    println!("Listening on {local_url}");
-    println!("Fusion mode: {}", fusion.as_str());
-    let stopped = axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            shutdown.await;
-            cancellation.cancel();
-        })
-        .await;
+    #[cfg(target_os = "linux")]
+    let mut control = None;
+    match mode {
+        RunMode::Foreground => {
+            println!("Data root: {}", catalog.root_path().display());
+            println!("Listening on http://{bound}");
+            println!("Fusion mode: {}", fusion.as_str());
+        }
+        #[cfg(target_os = "linux")]
+        RunMode::Daemon => {
+            let socket = daemon::Control::bind(catalog.root_path())?;
+            eprintln!("Listening on http://{bound}");
+            daemon::report_ready(bound)?;
+            control = Some(tokio::spawn(socket.wait(bound, cancellation.clone())));
+        }
+    }
+    let shutdown_token = cancellation.clone();
+    let stopped = axum::serve(
+        listener,
+        http_access(app).into_make_service_with_connect_info::<Connection>(),
+    )
+    .with_graceful_shutdown(async move {
+        tokio::select! {
+            _ = shutdown => {}
+            _ = shutdown_token.cancelled() => {}
+        }
+        shutdown_token.cancel();
+    })
+    .await;
+    cancellation.cancel();
     jobs.close();
     jobs.wait().await;
+    #[cfg(target_os = "linux")]
+    let reply = if let Some(control) = control {
+        let (socket, reply) = control.await??;
+        drop(socket);
+        reply
+    } else {
+        None
+    };
+    drop(catalog);
     stopped?;
+    #[cfg(target_os = "linux")]
+    if let Some(reply) = reply {
+        daemon::confirm_stop(reply).await;
+    }
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct Connection {
+    local: Option<SocketAddr>,
+    peer_is_loopback: bool,
+}
+
+impl Connected<IncomingStream<'_, TcpListener>> for Connection {
+    fn connect_info(stream: IncomingStream<'_, TcpListener>) -> Self {
+        Self {
+            local: stream.io().local_addr().ok(),
+            peer_is_loopback: stream.remote_addr().ip().to_canonical().is_loopback(),
+        }
+    }
+}
+
+fn http_access(app: Router) -> Router {
+    app.layer(middleware::from_fn(require_http_access))
+}
+
+async fn require_http_access(
+    ConnectInfo(connection): ConnectInfo<Connection>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let mut hosts = request.headers().get_all(header::HOST).iter();
+    let host = hosts.next().and_then(|value| value.to_str().ok());
+    if hosts.next().is_some() {
+        return (StatusCode::BAD_REQUEST, "Duplicate Host header.").into_response();
+    }
+    if !host.and_then(HttpAuthority::parse).is_some_and(|host| {
+        connection
+            .local
+            .is_some_and(|local| host.matches_socket(local, connection.peer_is_loopback))
+            && request
+                .uri()
+                .scheme_str()
+                .is_none_or(|scheme| scheme == "http")
+            && request.uri().authority().is_none_or(|target| {
+                HttpAuthority::parse(target.as_str())
+                    .is_some_and(|target| host.same_http_endpoint(&target))
+            })
+    }) {
+        return (
+            StatusCode::FORBIDDEN,
+            "Host does not match the connection endpoint.",
+        )
+            .into_response();
+    }
+    next.run(request).await
 }
 
 #[cfg(windows)]

@@ -47,6 +47,9 @@ h1 { font-size: 1.55rem; }
 h2 { font-size: 1.2rem; }
 h3 { font-size: 1.05rem; }
 .masthead h1 + p { margin-top: .25rem; color: var(--quiet); }
+.masthead-actions { display: flex; align-items: center; flex-wrap: wrap; gap: .5rem 1rem; }
+.masthead-actions a { color: var(--primary); text-underline-offset: .18em; }
+.masthead-actions a:hover { color: var(--primary-hover); }
 .identity {
   padding: .25rem .65rem;
   color: var(--primary-hover);
@@ -146,6 +149,30 @@ button:disabled, input:disabled, select:disabled { opacity: .66; cursor: not-all
 .library-row strong, .operation-list strong { overflow-wrap: anywhere; }
 .operation-id { display: block; color: var(--quiet); font-size: .8rem; overflow-wrap: anywhere; }
 .row-actions button { font-size: .875rem; }
+
+.activity { margin-top: 1rem; }
+.activity summary { cursor: pointer; }
+.activity summary h2 { display: inline; }
+.activity summary:hover { color: var(--primary); }
+.activity > .hint { margin-block: .55rem .75rem; }
+#activity-roster { margin: .75rem 0 0; padding: 0; list-style: none; }
+#activity-roster:empty { margin: 0; }
+#activity-roster > li { border-top: 1px solid var(--divider); }
+#activity-roster summary { padding-block: .55rem; }
+.activity time { font-variant-numeric: tabular-nums; }
+#activity-roster summary time { margin-inline-start: .65rem; }
+.activity-events { width: 100%; border-collapse: collapse; font-size: .875rem; }
+.activity-events th, .activity-events td {
+  padding: .35rem .6rem .35rem 0;
+  border-bottom: 1px solid var(--divider);
+  text-align: start;
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}
+.activity-events th, .activity-events td:nth-child(2), .activity-events td:last-child {
+  white-space: nowrap;
+}
+.activity-events tbody tr:last-child td { border-bottom: 0; }
 
 .search-results li { padding-block: .8rem 1rem; border-top: 1px solid var(--divider); }
 .source-title { font-size: 1rem; overflow-wrap: anywhere; }
