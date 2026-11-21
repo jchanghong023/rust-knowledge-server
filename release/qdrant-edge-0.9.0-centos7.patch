@@ -1,0 +1,30 @@
+diff --git a/src/common/universal_io/io_uring/mod.rs b/src/common/universal_io/io_uring/mod.rs
+--- a/src/common/universal_io/io_uring/mod.rs
++++ b/src/common/universal_io/io_uring/mod.rs
+@@ -387,19 +387,22 @@ impl io::Write for AppendWriter<'_> {
+     }
+ 
+     fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+         // SAFETY: `IoSlice` is guaranteed ABI-compatible with `iovec`, and
+         // `bufs` outlives the call. The caller keeps `bufs.len()` within
+-        // `IOV_MAX`.
++        // `IOV_MAX`. This release targets x86_64 Linux: the raw pwritev2
++        // syscall takes the low and high halves of its offset separately.
+         let written = unsafe {
+-            nix::libc::pwritev2(
++            nix::libc::syscall(
++                nix::libc::SYS_pwritev2,
+                 self.file.as_raw_fd(),
+-                bufs.as_ptr().cast(),
++                bufs.as_ptr().cast::<nix::libc::iovec>(),
+                 bufs.len() as i32,
+-                0,
++                0 as nix::libc::c_ulong,
++                0 as nix::libc::c_ulong,
+                 nix::libc::RWF_APPEND,
+             )
+         };
+ 
+         usize::try_from(written).map_err(|_| io::Error::last_os_error())
+     }
+ 

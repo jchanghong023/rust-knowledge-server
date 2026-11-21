@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>知识库工作台</title>
+  <link rel="stylesheet" href="/app.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="masthead">
+    <div class="page masthead-inner">
+      <div>
+        <h1>知识库工作台</h1>
+        <p>管理共享 Markdown 文档，检索并核对原文。</p>
+      </div>
+      <p id="current-employee" class="identity" hidden></p>
+    </div>
+  </header>
+  <main class="page">
+    <noscript><p>请启用 JavaScript 后使用工作台。</p></noscript>
+    <p id="session-check" role="status">正在检查登记会话…</p>
+
+    <section id="registration" class="panel registration" aria-labelledby="registration-title" hidden>
+      <h2 id="registration-title">登记工号</h2>
+      <p id="registration-help">工号由你自行填写，仅用于操作留痕，不验证身份。所有已登记人员的权限相同。</p>
+      <form id="registration-form">
+        <label for="employee">工号</label>
+        <input id="employee" name="employee" type="text" inputmode="numeric" pattern="[0-9]{8}"
+          title="请输入恰好 8 位数字，保留前导零" aria-describedby="employee-help registration-help" required>
+        <p id="employee-help" class="hint">恰好 8 位数字（0–9），例如 00001234。</p>
+        <button class="primary" type="submit">登记并进入</button>
+      </form>
+      <p id="registration-status" class="message" role="status"></p>
+    </section>
+
+    <div id="workbench" class="workspace" hidden>
+      <section class="panel" aria-labelledby="libraries-title">
+        <div class="section-heading">
+          <h2 id="libraries-title">知识库</h2>
+          <button id="refresh-libraries" type="button">刷新列表</button>
+        </div>
+        <form id="create-form" class="field-group">
+          <label for="library-name">新建知识库名称</label>
+          <div class="control-row">
+            <input id="library-name" name="name" type="text" required>
+            <button type="submit">创建</button>
+          </div>
+        </form>
+        <p id="library-action-status" class="message" role="status"></p>
+        <p id="libraries-status" class="message" role="status"></p>
+        <ul id="library-list" class="library-list" aria-label="知识库列表"></ul>
+
+        <section id="import-section" class="subsection" aria-labelledby="import-title" hidden>
+          <h3 id="import-title">导入 Markdown</h3>
+          <p id="import-library"></p>
+          <p id="import-help" class="hint">选择多个文件或一个文件夹；仅支持 UTF-8 编码的 .md 文件（扩展名不区分大小写）。选择文件夹时保留相对路径。</p>
+          <form id="import-form">
+            <fieldset id="import-fields" aria-describedby="import-help">
+              <legend class="visually-hidden">选择导入文件</legend>
+              <div class="field-group">
+                <label for="markdown-files">选择 Markdown 文件</label>
+                <input id="markdown-files" type="file" accept=".md" multiple>
+              </div>
+              <div class="field-group">
+                <label for="markdown-directory">或选择文件夹</label>
+                <input id="markdown-directory" type="file" webkitdirectory multiple>
+              </div>
+              <p id="import-selection" class="message" role="status"></p>
+              <button class="primary" type="submit">上传并导入</button>
+              <button id="cancel-import" type="button">取消选择</button>
+            </fieldset>
+          </form>
+          <p id="import-status" class="message" role="status"></p>
+        </section>
+
+        <section id="operations-section" class="subsection" aria-labelledby="operations-title" hidden>
+          <h3 id="operations-title">导入状态</h3>
+          <ul id="operation-list" class="operation-list"></ul>
+        </section>
+      </section>
+
+      <section class="panel" aria-labelledby="search-title">
+        <h2 id="search-title">测试搜索</h2>
+        <form id="search-form">
+          <fieldset id="search-fields">
+            <legend class="visually-hidden">搜索条件</legend>
+            <div class="field-group">
+              <label for="search-query">搜索内容</label>
+              <input id="search-query" name="query" type="search" required>
+            </div>
+            <div class="search-filters">
+              <div class="field-group">
+                <label for="search-library">知识库范围</label>
+                <select id="search-library" name="library">
+                  <option value="">全部知识库</option>
+                </select>
+              </div>
+              <div class="field-group">
+                <label for="search-path">相对路径（可选）</label>
+                <input id="search-path" name="path" type="text" aria-describedby="path-help">
+                <p id="path-help" class="hint">可填目录或文件，使用 / 分隔，如 docs/guide.md。</p>
+              </div>
+            </div>
+            <button class="primary" type="submit">搜索</button>
+          </fieldset>
+        </form>
+        <section class="subsection" aria-labelledby="results-title">
+          <h3 id="results-title">搜索结果</h3>
+          <p id="search-status" class="message" role="status">输入搜索内容后，可在这里查看原文与来源。</p>
+          <p id="search-summary" class="hint" hidden></p>
+          <ol id="search-results" class="search-results"></ol>
+        </section>
+      </section>
+    </div>
+  </main>
+
+  <dialog id="confirmation" aria-labelledby="confirmation-title" aria-describedby="confirmation-message">
+    <form method="dialog">
+      <h2 id="confirmation-title"></h2>
+      <p id="confirmation-message"></p>
+      <div class="dialog-actions">
+        <button value="cancel" autofocus>取消</button>
+        <button id="confirm-action" value="confirm"></button>
+      </div>
+    </form>
+  </dialog>
+</body>
+</html>
