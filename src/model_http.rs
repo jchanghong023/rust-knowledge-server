@@ -1,6 +1,6 @@
 use std::{fmt, time::Duration};
 
-use reqwest::{Client, StatusCode, Url, header::HeaderValue};
+use reqwest::{Client, RequestBuilder, StatusCode, Url, header::HeaderValue};
 use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 
 pub(crate) struct ApiConfig {
@@ -52,6 +52,14 @@ impl fmt::Display for ModelError {
 
 impl std::error::Error for ModelError {}
 
+fn request_error(error: reqwest::Error) -> ModelError {
+    if error.is_timeout() {
+        ModelError::Timeout
+    } else {
+        ModelError::Request
+    }
+}
+
 struct ModelApi {
     client: Client,
     endpoint: Url,
@@ -92,28 +100,22 @@ impl ModelApi {
         })
     }
 
-    async fn post<T: Serialize, R: DeserializeOwned>(&self, body: T) -> Result<R, ModelError> {
-        let mut request = self.client.post(self.endpoint.clone()).json(&body);
+    fn request(&self, body: impl Serialize) -> RequestBuilder {
+        let request = self.client.post(self.endpoint.clone()).json(&body);
         if let Some(authorization) = &self.authorization {
-            request = request.header(reqwest::header::AUTHORIZATION, authorization.clone());
+            request.header(reqwest::header::AUTHORIZATION, authorization.clone())
+        } else {
+            request
         }
-        let response = request.send().await.map_err(|error| {
-            if error.is_timeout() {
-                ModelError::Timeout
-            } else {
-                ModelError::Request
-            }
-        })?;
+    }
+
+    async fn send<R: DeserializeOwned>(request: RequestBuilder) -> Result<R, ModelError> {
+        let response = request.send().await.map_err(request_error)?;
         if !response.status().is_success() {
             return Err(ModelError::Status(response.status()));
         }
-        response.json().await.map_err(|error| {
-            if error.is_timeout() {
-                ModelError::Timeout
-            } else {
-                ModelError::InvalidReply
-            }
-        })
+        let body = response.bytes().await.map_err(request_error)?;
+        serde_json::from_slice(&body).map_err(|_| ModelError::InvalidReply)
     }
 
     fn validate_reply(
@@ -168,6 +170,31 @@ fn present_model<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<St
 pub(crate) struct Embedding {
     api: ModelApi,
     dimensions: usize,
+}
+
+const IMPORT_EMBEDDING_TIMEOUT: Duration = Duration::from_secs(90);
+const IMPORT_EMBEDDING_ATTEMPTS: usize = 10;
+const IMPORT_EMBEDDING_RETRY_DELAY: Duration = Duration::from_secs(10);
+
+async fn send_import_embedding(request: RequestBuilder) -> Result<EmbeddingReply, ModelError> {
+    let request = request.timeout(IMPORT_EMBEDDING_TIMEOUT);
+    for _ in 1..IMPORT_EMBEDDING_ATTEMPTS {
+        // JSON bodies are buffered and can be reused without another serialization.
+        let Some(attempt) = request.try_clone() else {
+            break;
+        };
+        match ModelApi::send(attempt).await {
+            Err(ModelError::Timeout | ModelError::Request) => {}
+            Err(ModelError::Status(status))
+                if matches!(
+                    status,
+                    StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_MANY_REQUESTS
+                ) || status.is_server_error() => {}
+            result => return result,
+        }
+        tokio::time::sleep(IMPORT_EMBEDDING_RETRY_DELAY).await;
+    }
+    ModelApi::send(request).await
 }
 
 #[derive(Serialize)]
@@ -237,16 +264,33 @@ impl Embedding {
     }
 
     pub(crate) async fn embed(&self, inputs: &[&str]) -> Result<Vec<Vec<f32>>, ModelError> {
+        self.embed_with_policy(inputs, false).await
+    }
+
+    pub(crate) async fn embed_for_import(
+        &self,
+        inputs: &[&str],
+    ) -> Result<Vec<Vec<f32>>, ModelError> {
+        self.embed_with_policy(inputs, true).await
+    }
+
+    async fn embed_with_policy(
+        &self,
+        inputs: &[&str],
+        importing: bool,
+    ) -> Result<Vec<Vec<f32>>, ModelError> {
         if inputs.is_empty() {
             return Ok(Vec::new());
         }
-        let reply: EmbeddingReply = self
-            .api
-            .post(EmbeddingRequest {
-                model: self.model(),
-                input: inputs,
-            })
-            .await?;
+        let request = self.api.request(EmbeddingRequest {
+            model: self.model(),
+            input: inputs,
+        });
+        let reply: EmbeddingReply = if importing {
+            send_import_embedding(request).await?
+        } else {
+            ModelApi::send(request).await?
+        };
         self.api
             .validate_reply(reply.model.as_deref(), inputs.len(), reply.data.len())?;
         let mut vectors = vec![Vec::new(); inputs.len()];
@@ -306,14 +350,12 @@ impl Rerank {
         if candidates.is_empty() {
             return Ok(Vec::new());
         }
-        let reply: RerankReply = self
-            .api
-            .post(RerankRequest {
-                model: &self.api.model,
-                query,
-                documents: candidates,
-            })
-            .await?;
+        let reply: RerankReply = ModelApi::send(self.api.request(RerankRequest {
+            model: &self.api.model,
+            query,
+            documents: candidates,
+        }))
+        .await?;
         self.api.validate_reply(
             reply.model.as_deref(),
             candidates.len(),

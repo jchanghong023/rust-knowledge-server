@@ -12,6 +12,8 @@ const importSection = byId("import-section");
 const importFields = byId("import-fields");
 const fileInput = byId("markdown-files");
 const directoryInput = byId("markdown-directory");
+const pathInput = byId("markdown-path");
+const importButton = byId("submit-import");
 const uploadProgress = byId("upload-progress");
 const dialog = byId("confirmation");
 const cancelConfirmation = byId("cancel-confirmation");
@@ -136,8 +138,8 @@ function activateSession(session, focusWorkbench = false) {
   }
 }
 
-function libraryUrl(name, importing = false) {
-  return `/api/library${importing ? "/import" : ""}?name=${encodeURIComponent(name)}`;
+function libraryUrl(name, action = "") {
+  return `/api/library${action}?name=${encodeURIComponent(name)}`;
 }
 
 function renderLibraryPaths(name) {
@@ -316,6 +318,12 @@ function selectedDocuments() {
 }
 
 function showSelection() {
+  const byPath = pathInput.value.trim() !== "";
+  importButton.textContent = byPath ? "按路径导入" : "上传并导入";
+  if (byPath) {
+    message("import-selection", "");
+    return;
+  }
   const { fromDirectory, documents, skipped } = selectedDocuments();
   if (!fromDirectory && skipped) {
     message("import-selection", "所选文件中包含非 .md 文件。请重新选择；不会只导入其中一部分。", "error");
@@ -657,51 +665,74 @@ byId("create-form").addEventListener("submit", async (event) => {
 
 for (const [input, other] of [[fileInput, directoryInput], [directoryInput, fileInput]]) {
   input.addEventListener("change", () => {
-    if (input.files.length) other.value = "";
+    if (input.files.length) {
+      other.value = "";
+      pathInput.value = "";
+    }
     message("import-status", "");
     showSelection();
   });
 }
+pathInput.addEventListener("input", () => {
+  if (pathInput.value.trim()) fileInput.value = directoryInput.value = "";
+  message("import-status", "");
+  showSelection();
+});
 byId("cancel-import").addEventListener("click", () => closeImport(true));
 
 byId("import-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const name = importTarget;
   if (name === null || importFields.disabled) return;
+  const sourcePath = pathInput.value;
+  const byPath = sourcePath.trim() !== "";
   const { fromDirectory, documents, skipped } = selectedDocuments();
-  if (!documents.length || (!fromDirectory && skipped)) {
-    message("import-status", "请选择 .md 文件，或选择至少包含一个 .md 文件的文件夹。", "error");
+  if (!byPath && (!documents.length || (!fromDirectory && skipped))) {
+    message("import-status", "请选择 Markdown 文件或文件夹，或输入服务器上的绝对路径。", "error");
     return;
   }
   const excluded = skipped ? `文件夹内的 ${skipped} 个非 .md 文件将跳过。` : "";
-  const note = `将 ${documents.length} 个 Markdown 文件导入「${name}」。${excluded}如果该库已有发布版本，导入成功后将整库替换，未随本次上传的旧文档将不再可查。`;
-  const trigger = event.currentTarget.querySelector("button[type=submit]");
-  if (!await confirmAction("确认整库导入", note, "确认上传", trigger) || employee === null || importTarget !== name) return;
+  const source = byPath
+    ? `从「${sourcePath}」导入 Markdown 到「${name}」。`
+    : `将 ${documents.length} 个 Markdown 文件导入「${name}」。${excluded}`;
+  const note = `${source}如果该库已有发布版本，导入成功后将整库替换，本次未导入的旧文档将不再可查。`;
+  const action = byPath ? "确认导入" : "确认上传";
+  if (!await confirmAction("确认整库导入", note, action, importButton) || employee === null || importTarget !== name) return;
   importFields.disabled = true;
-  uploadProgress.removeAttribute("value");
-  uploadProgress.hidden = false;
-  message("import-status", "正在上传文件…");
+  if (byPath) {
+    message("import-status", "服务器正在读取并校验文件…");
+  } else {
+    uploadProgress.removeAttribute("value");
+    uploadProgress.hidden = false;
+    message("import-status", "正在上传文件…");
+  }
   try {
-    const body = new FormData();
-    for (const { path, file } of documents) {
-      body.append("path", path);
-      body.append("file", file);
+    let accepted;
+    if (byPath) {
+      accepted = await request(libraryUrl(name, "/import-path"), jsonBody({ path: sourcePath }));
+    } else {
+      const body = new FormData();
+      for (const { path, file } of documents) {
+        body.append("path", path);
+        body.append("file", file);
+      }
+      accepted = await uploadImport(libraryUrl(name, "/import"), body);
     }
-    const { id } = await uploadImport(libraryUrl(name, true), body);
+    const { id } = accepted;
     const job = trackOperation(id, name);
     operationStatus(job, "in_progress", "已接收，正在检查导入状态…", "info");
     savePendingOperations();
     if (importTarget === name) {
       byId("import-form").reset();
       showSelection();
-      message("import-status", "上传已接收，请在下方查看导入状态。", "success");
+      message("import-status", "文件已校验，请在下方查看导入状态。", "success");
     }
     void pollOperation(job);
   } catch (error) {
-    showError("import-status", "上传未确认", error);
+    showError("import-status", byPath ? "路径导入未确认" : "上传未确认", error);
     if (error.operationId) {
       const job = trackOperation(error.operationId, name);
-      operationStatus(job, "unavailable", "上传响应未确认，正在检查操作状态…", "info");
+      operationStatus(job, "unavailable", "导入响应未确认，正在检查操作状态…", "info");
       savePendingOperations();
       void pollOperation(job);
     }

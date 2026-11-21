@@ -1,7 +1,8 @@
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use qdrant_edge::EdgeShard;
 use uuid::Uuid;
@@ -82,13 +83,43 @@ impl Shard {
                     edge: open_existing(path)?,
                     generation: None,
                 }),
-                Location::Published(version) => Ok(Opened {
-                    generation: durable::verify_version(version)?,
-                    edge: open_existing(&version.join("index"))?,
-                }),
+                Location::Published(version) => open_published(version),
             })
             .as_ref()
     }
+}
+
+fn open_published(version: &Path) -> io::Result<Opened> {
+    let start = Instant::now();
+    let verified = durable::verify_version(version);
+    let verify = start.elapsed();
+    let mut edge_load = Duration::ZERO;
+    let status_on_error = if verified.is_ok() {
+        "load_error"
+    } else {
+        "verify_error"
+    };
+    let result = verified.and_then(|generation| {
+        let start = Instant::now();
+        let edge = open_existing(&version.join("index"));
+        edge_load = start.elapsed();
+        Ok(Opened {
+            edge: edge?,
+            generation,
+        })
+    });
+    let status = if result.is_ok() {
+        "ok"
+    } else {
+        status_on_error
+    };
+    let _ = writeln!(
+        io::stderr().lock(),
+        "shard_open_timing status={status} verify_us={} edge_load_us={}",
+        verify.as_micros(),
+        edge_load.as_micros(),
+    );
+    result
 }
 
 fn open_existing(path: &Path) -> io::Result<EdgeShard> {

@@ -43,7 +43,7 @@ Open `http://127.0.0.1:9333` for the UI. On Linux, the binary also supports `sta
 - `src/main.rs` and `src/settings.rs` — startup, shared HTTP Host checks, CLI parsing and help. `src/daemon.rs` owns Linux background control.
 - `src/catalog.rs`, `src/durable.rs`, and `src/shard.rs` — publication, integrity checks, and lazy open of pinned generations. `src/data_root.rs` owns platform checks and the exclusive lock.
 - `src/model_http.rs` and `src/model_defaults.rs` — optional model clients and Linux-only gateway defaults. `Cargo.toml`, `Cargo.lock`, and `.cargo/config.toml` define dependencies and Windows static CRT flags.
-- `PRODUCT.md` and `DESIGN.md` describe Web behavior and design. `README.md` is the user-facing quickstart; don't edit it for internal developer guidance.
+- `PRODUCT.md` and `DESIGN.md` describe Web behavior and design. `README.md` is the user-facing quickstart. Do not modify `README.md` unless the user explicitly requests a README change.
 
 ## Runtime/Tooling Preferences
 

@@ -43,8 +43,6 @@ const SESSION_TTL: Duration = Duration::from_secs(12 * 60 * 60);
 const MAX_SESSIONS: usize = 4096;
 const SESSION_BODY_LIMIT: usize = 1024;
 const JSON_BODY_LIMIT: usize = 32 * 1024;
-// Cap the entire multipart body (metadata, boundaries, and files) at 1 GiB.
-const IMPORT_BODY_LIMIT: usize = 1024 * 1024 * 1024;
 
 pub(crate) fn router(
     catalog: Arc<Catalog>,
@@ -74,7 +72,11 @@ pub(crate) fn router(
         )
         .route(
             "/api/library/import",
-            post(import_library).layer(DefaultBodyLimit::max(IMPORT_BODY_LIMIT)),
+            post(import_library).layer(DefaultBodyLimit::max(import::MAX_IMPORT_BYTES)),
+        )
+        .route(
+            "/api/library/import-path",
+            post(import_local_path).layer(DefaultBodyLimit::max(JSON_BODY_LIMIT)),
         )
         .route("/api/operations/{id}", get(operation_status))
         .route("/api/activity", get(recent_employees))
@@ -485,6 +487,17 @@ struct OperationReply {
     progress: Option<ImportProgress>,
 }
 
+enum ImportSource {
+    Upload(Multipart),
+    LocalPath(String),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalImportRequest {
+    path: String,
+}
+
 async fn import_library(
     State(web): State<Arc<Web>>,
     employee: Employee,
@@ -499,8 +512,29 @@ async fn import_library(
             "expected a multipart upload with a valid boundary",
         )
     })?;
+    submit_import(web, employee, name, ImportSource::Upload(multipart)).await
+}
+
+async fn import_local_path(
+    State(web): State<Arc<Web>>,
+    employee: Employee,
+    request: Result<Query<LibraryRequest>, QueryRejection>,
+    path: Result<Json<LocalImportRequest>, JsonRejection>,
+) -> Result<Response, ApiError> {
+    let Query(LibraryRequest { name }) = request
+        .map_err(|_| ApiError::invalid("a single library name query parameter is required"))?;
+    let Json(LocalImportRequest { path }) = path.map_err(ApiError::json)?;
+    submit_import(web, employee, name, ImportSource::LocalPath(path)).await
+}
+
+async fn submit_import(
+    web: Arc<Web>,
+    employee: Employee,
+    name: String,
+    source: ImportSource,
+) -> Result<Response, ApiError> {
     let Ok(permit) = Arc::clone(&web.import_slots).try_acquire_owned() else {
-        drop(multipart);
+        drop(source);
         return web
             .blocking(move |web| {
                 let op = web.begin(employee, Action::Import, Some(&name))?;
@@ -520,7 +554,7 @@ async fn import_library(
     let runtime = Handle::current();
     drop(web.jobs.spawn(async move {
         let _permit = permit;
-        let (op, build, batch) = match prepare_import(&worker, employee, name, multipart).await {
+        let (op, build, batch) = match prepare_import(&worker, employee, name, source).await {
             Ok(prepared) => prepared,
             Err(error) => {
                 let _ = submitted.send(Err(error));
@@ -598,7 +632,7 @@ async fn prepare_import(
     web: &Arc<Web>,
     employee: Employee,
     name: String,
-    multipart: Multipart,
+    source: ImportSource,
 ) -> Result<(Operation, Build, Batch), ApiError> {
     let (op, build) = web
         .blocking(move |web| {
@@ -610,11 +644,22 @@ async fn prepare_import(
             Ok((op, build))
         })
         .await?;
-    match import::stage(multipart, web.catalog.stage_root()).await {
+    let batch = match source {
+        ImportSource::Upload(multipart) => import::stage(multipart, web.catalog.stage_root())
+            .await
+            .map_err(ApiError::from),
+        ImportSource::LocalPath(path) => {
+            web.blocking(move |web| {
+                import::stage_local(&path, web.catalog.stage_root()).map_err(ApiError::from)
+            })
+            .await
+        }
+    };
+    match batch {
         Ok(batch) => Ok((op, build, batch)),
         Err(error) => {
             web.blocking(move |web| {
-                let failure = web.finish_failure(&op, error.into());
+                let failure = web.finish_failure(&op, error);
                 drop(build);
                 Err(failure)
             })
@@ -851,7 +896,7 @@ impl From<ImportError> for ApiError {
                 "invalid_input",
                 error.to_string(),
             ),
-            ImportError::Storage { .. } => Self::storage("upload staging storage is unavailable"),
+            ImportError::Storage { .. } => Self::storage("import staging storage is unavailable"),
         }
     }
 }

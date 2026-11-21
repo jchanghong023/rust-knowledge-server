@@ -5,6 +5,7 @@ use std::io::{self, BufWriter, Write};
 use std::path::Path;
 use std::sync::OnceLock;
 
+use futures_util::{StreamExt, TryStreamExt, stream};
 use qdrant_edge::bm25_embed::{EdgeBm25, EdgeBm25Config, EdgeBm25Error};
 use qdrant_edge::{
     CreateIndex, DisabledStemmerParams, Distance, EdgeConfigBuilder, EdgeShard,
@@ -30,10 +31,13 @@ pub(crate) const SEMANTIC_VECTOR: &str = "embedding";
 pub(crate) const SCOPE_FIELD: &str = "scope";
 pub(crate) const EXACT_FIELD: &str = "exact";
 const PATH_FIELD: &str = "path";
+const TEXT_FIELD: &str = "text";
 
-// Markdown already limits each section's length. This limits both the Edge update
-// and the corresponding HTTP request independently of the source document size.
+// Match OMP's import window and request limits, including across file boundaries.
 const POINT_BATCH: usize = 16;
+const EMBEDDING_CONCURRENCY: usize = 8;
+const EMBEDDING_WINDOW: usize = POINT_BATCH * EMBEDDING_CONCURRENCY;
+const EMBEDDING_REQUEST_UNITS: usize = 32_768;
 pub(crate) const EMBEDDING_GENERATION: &str = "embeddings.json";
 const EMBEDDING_ENCODING: &str = "float32-cosine";
 
@@ -178,8 +182,26 @@ pub(crate) fn build(
             .map_err(|error| IndexError::Edge("create Edge keyword payload index", error))?;
     }
 
+    let write_points = |mut points: Vec<_>, embedding_error: &mut Option<ModelError>| {
+        if let Some(provider) = embedding.filter(|_| embedding_error.is_none())
+            && let Err(error) = runtime.block_on(add_embeddings(provider, &mut points))
+        {
+            *embedding_error = Some(error);
+        }
+        shard
+            .update(UpdateOperation::PointOperation(
+                PointOperations::UpsertPoints(PointInsertOperations::PointsList(points)),
+            ))
+            .map_err(|error| IndexError::Edge("write Edge passage batch", error))
+    };
     let mut embedding_error = None;
     let mut last_id = 0_u64;
+    let mut point_limit = if embedding.is_some() {
+        EMBEDDING_WINDOW
+    } else {
+        POINT_BATCH
+    };
+    let mut points = Vec::new();
     for (completed, document) in batch.documents().iter().enumerate() {
         let source = document.read_body().map_err(IndexError::Document)?;
         let scope: Vec<_> = document
@@ -188,52 +210,38 @@ pub(crate) fn build(
             .map(|(end, _)| &document.relative_path[..end])
             .chain(std::iter::once(document.relative_path.as_str()))
             .collect();
-        let sections = markdown::sections(&source);
-        let batches = sections.chunks(POINT_BATCH);
-        let batch_count = batches.len();
-        for (number, sections) in batches.enumerate() {
-            let mut vectors = Vec::new();
-            if let Some(provider) = embedding.filter(|_| embedding_error.is_none()) {
-                let mut inputs = [""; POINT_BATCH];
-                for (input, section) in inputs.iter_mut().zip(sections) {
-                    *input = section.text;
-                }
-                match runtime.block_on(provider.embed(&inputs[..sections.len()])) {
-                    Ok(batch) if batch.iter().all(|vector| usable_embedding(vector)) => {
-                        vectors = batch;
-                    }
-                    Ok(_) => embedding_error = Some(ModelError::InvalidVector),
-                    Err(error) => embedding_error = Some(error),
-                }
-            }
-            let mut vectors = vectors.into_iter();
-            let mut points = Vec::with_capacity(sections.len());
-            for section in sections {
-                last_id = last_id.checked_add(1).ok_or(IndexError::PointCount)?;
-                let mut named = HashMap::with_capacity(if vectors.len() == 0 { 1 } else { 2 });
-                named.insert(
-                    KEYWORD_VECTOR.to_owned(),
-                    VectorPersisted::Sparse(model.embed_document(section.text)),
-                );
-                if let Some(vector) = vectors.next() {
-                    named.insert(SEMANTIC_VECTOR.to_owned(), VectorPersisted::Dense(vector));
-                }
-                points.push(PointStructPersisted {
-                    id: last_id.into(),
-                    vector: VectorStructPersisted::Named(named),
-                    payload: Some(passage_payload(document, &source, section, &scope)),
-                });
-            }
-            shard
-                .update(UpdateOperation::PointOperation(
-                    PointOperations::UpsertPoints(PointInsertOperations::PointsList(points)),
-                ))
-                .map_err(|error| IndexError::Edge("write Edge passage batch", error))?;
-            report_progress(completed + usize::from(number + 1 == batch_count), last_id);
-        }
-        if batch_count == 0 {
+        let mut sections = markdown::sections(&source).into_iter().peekable();
+        if sections.peek().is_none() && points.is_empty() {
             report_progress(completed + 1, last_id);
         }
+        while let Some(section) = sections.next() {
+            if points.is_empty() {
+                points.reserve_exact(point_limit);
+            }
+            last_id = last_id.checked_add(1).ok_or(IndexError::PointCount)?;
+            let named = HashMap::from([(
+                KEYWORD_VECTOR.to_owned(),
+                VectorPersisted::Sparse(model.embed_document(section.text)),
+            )]);
+            points.push(PointStructPersisted {
+                id: last_id.into(),
+                vector: VectorStructPersisted::Named(named),
+                payload: Some(passage_payload(document, &source, &section, &scope)),
+            });
+            let file_done = sections.peek().is_none();
+            if points.len() == point_limit || (point_limit == POINT_BATCH && file_done) {
+                write_points(points, &mut embedding_error)?;
+                report_progress(completed + usize::from(file_done), last_id);
+                if embedding_error.is_some() {
+                    point_limit = POINT_BATCH;
+                }
+                points = Vec::new();
+            }
+        }
+    }
+    if !points.is_empty() {
+        write_points(points, &mut embedding_error)?;
+        report_progress(batch.documents().len(), last_id);
     }
     shard
         .flush()
@@ -270,6 +278,69 @@ pub(crate) fn build(
             .map_err(|error| IndexError::Storage("write embedding generation", error))?;
     }
     Ok(embedding_error)
+}
+
+async fn add_embeddings(
+    provider: &Embedding,
+    points: &mut [PointStructPersisted],
+) -> Result<(), ModelError> {
+    let mut texts = points
+        .iter()
+        .map(|point| {
+            let text = point.payload.as_ref().unwrap().0[TEXT_FIELD]
+                .as_str()
+                .unwrap();
+            let units = if text.is_ascii() {
+                text.len()
+            } else {
+                text.encode_utf16().count()
+            };
+            (text, units)
+        })
+        .peekable();
+    let mut offset = 0;
+    let requests = std::iter::from_fn(move || {
+        let mut inputs = [""; POINT_BATCH];
+        let mut used = 0;
+        let mut len = 0;
+        while len < inputs.len() {
+            let Some(&(text, units)) = texts.peek() else {
+                break;
+            };
+            if len != 0 && used + units > EMBEDDING_REQUEST_UNITS {
+                break;
+            }
+            inputs[len] = text;
+            len += 1;
+            used += units;
+            texts.next();
+        }
+        if len == 0 {
+            return None;
+        }
+        let start = offset;
+        offset += len;
+        Some(async move {
+            let vectors = provider.embed_for_import(&inputs[..len]).await?;
+            if !vectors.iter().all(|vector| usable_embedding(vector)) {
+                return Err(ModelError::InvalidVector);
+            }
+            Ok((start, vectors))
+        })
+    });
+    let replies: Vec<_> = stream::iter(requests)
+        .buffer_unordered(EMBEDDING_CONCURRENCY)
+        .try_collect()
+        .await?;
+    for (start, vectors) in replies {
+        for (point, vector) in points[start..].iter_mut().zip(vectors) {
+            let VectorStructPersisted::Named(named) = &mut point.vector else {
+                unreachable!("import passages have named vectors");
+            };
+            named.insert(SEMANTIC_VECTOR.to_owned(), VectorPersisted::Dense(vector));
+        }
+    }
+    Ok(())
 }
 
 /// Older versions only recorded paths on passage payloads.
@@ -311,7 +382,7 @@ fn passage_payload(
     let exact = technical::section_names(source, span);
     Payload(Map::from_iter(
         [
-            ("text", Value::from(section.text)),
+            (TEXT_FIELD, Value::from(section.text)),
             (PATH_FIELD, Value::from(document.relative_path.as_str())),
             ("line_start", Value::from(section.line_start)),
             ("line_end", Value::from(section.line_end)),

@@ -85,8 +85,13 @@
                 <label for="markdown-directory">或选择文件夹</label>
                 <input id="markdown-directory" type="file" webkitdirectory multiple>
               </div>
+              <div class="field-group">
+                <label for="markdown-path">或输入文件或目录的绝对路径</label>
+                <input id="markdown-path" type="text" autocomplete="off" spellcheck="false" aria-describedby="local-path-help">
+                <p id="local-path-help" class="hint">填写服务器能读取的路径，例如 NFS 挂载路径。目录会递归导入 UTF-8 .md 文件。</p>
+              </div>
               <p id="import-selection" class="message" role="status"></p>
-              <button class="primary" type="submit">上传并导入</button>
+              <button id="submit-import" class="primary" type="submit">上传并导入</button>
               <button id="cancel-import" type="button">取消选择</button>
             </fieldset>
           </form>

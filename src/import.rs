@@ -1,17 +1,14 @@
-//! Validates and stages an entire Markdown upload before handing it to the builder.
+//! Validates and stages a complete Markdown batch before handing it to the builder.
 //!
-//! The multipart body repeats `path` (UTF-8 relative-path metadata) followed by
-//! `file` (raw Markdown bytes). Neither the path nor the browser filename is
-//! used to access a client or server filesystem location. The caller must
-//! authorize and audit the upload before staging, supply an approved staging
-//! root, and publish separately. Temporary files are not durable state; the
-//! batch owns cleanup on drop, and startup recovery must handle process exits
-//! that prevent destructors from running.
+//! Multipart `path` fields are relative metadata, never filesystem locations.
+//! Local path imports enter through a separate, authorized caller. Both modes
+//! snapshot raw bytes; the batch owns cleanup of the temporary copies.
 
 use std::collections::HashSet;
 use std::fmt;
-use std::io;
-use std::path::{Path, PathBuf};
+use std::fs::{self, Metadata, OpenOptions};
+use std::io::{self, Read, Write};
+use std::path::{Component, Path, PathBuf};
 use std::str;
 
 use axum::extract::Multipart;
@@ -22,6 +19,7 @@ use tempfile::TempDir;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 
+pub(crate) const MAX_IMPORT_BYTES: usize = 1024 * 1024 * 1024;
 const MAX_PATH_BYTES: usize = 16 * 1024;
 const PATH_TOO_LONG: &str = "path must not exceed 16 KiB (16384 UTF-8 bytes)";
 
@@ -74,7 +72,7 @@ impl fmt::Display for ImportError {
                 }
                 f.write_str(reason)
             }
-            Self::PayloadTooLarge => f.write_str("multipart upload exceeds the request body limit"),
+            Self::PayloadTooLarge => f.write_str("import exceeds the 1 GiB size limit"),
             Self::Storage { operation, .. } => write!(f, "cannot {operation}"),
         }
     }
@@ -154,13 +152,7 @@ pub(crate) async fn stage(
     mut multipart: Multipart,
     stage_root: &Path,
 ) -> Result<Batch, ImportError> {
-    let directory = tempfile::Builder::new()
-        .prefix("import-")
-        .tempdir_in(stage_root)
-        .map_err(|source| ImportError::Storage {
-            operation: "create the upload staging directory",
-            source,
-        })?;
+    let directory = staging_directory(stage_root)?;
     let mut documents = Vec::new();
     while let Some(field) = multipart
         .next_field()
@@ -175,14 +167,13 @@ pub(crate) async fn stage(
             .await
             .map_err(|error| error.at_document(number))?;
         validate_path(&relative_path).map_err(|error| error.at_document(number))?;
-        if !relative_path
-            .rsplit('/')
-            .next()
-            .and_then(|name| name.rsplit_once('.'))
-            .is_some_and(|(stem, extension)| {
-                !stem.is_empty() && extension.eq_ignore_ascii_case("md")
-            })
-        {
+        if !is_markdown(
+            relative_path
+                .rsplit('/')
+                .next()
+                .unwrap_or_default()
+                .as_bytes(),
+        ) {
             return Err(ImportError::invalid("path must name a .md file").at_document(number));
         }
 
@@ -236,6 +227,215 @@ pub(crate) async fn stage(
     })
 }
 
+/// Stage one file or recurse through a directory on the machine running the
+/// service. Only the staged snapshot and slash-separated relative names reach
+/// the builder; the chosen directory's name is retained, like a browser upload.
+pub(crate) fn stage_local(path: &str, stage_root: &Path) -> Result<Batch, ImportError> {
+    let source = Path::new(path);
+    if !source.is_absolute()
+        || path.len() > MAX_PATH_BYTES
+        || path.chars().any(char::is_control)
+        || source.components().any(|part| part == Component::ParentDir)
+    {
+        return Err(ImportError::invalid(
+            "enter an absolute path without '..' or control characters (at most 16 KiB)",
+        ));
+    }
+    #[cfg(windows)]
+    if !matches!(
+        source.components().next(),
+        Some(Component::Prefix(prefix)) if matches!(prefix.kind(), std::path::Prefix::Disk(_))
+    ) || path.as_bytes()[2..].contains(&b':')
+    {
+        return Err(ImportError::invalid("enter an absolute Windows drive path"));
+    }
+    // Strip trailing separators before checking the final entry, so a trailing
+    // slash does not turn a symbolic link into a directory lookup on Linux.
+    let source: PathBuf = source.components().collect();
+    let metadata = fs::symlink_metadata(&source).map_err(|error| match error.kind() {
+        io::ErrorKind::NotFound => ImportError::invalid("服务器上不存在该路径"),
+        _ => ImportError::invalid("服务器无法读取该路径"),
+    })?;
+    if is_link(&metadata) || !(metadata.is_dir() || metadata.is_file()) {
+        return Err(ImportError::invalid(
+            "the local path must be a regular file or directory, not a link",
+        ));
+    }
+    let relative_to = source.parent().unwrap_or(&source);
+    let directory = staging_directory(stage_root)?;
+    let mut documents = Vec::new();
+    let mut remaining = MAX_IMPORT_BYTES;
+    let mut buffer = [0; 64 * 1024];
+    let mut stage = |file: &Path| {
+        let number = documents.len() + 1;
+        let relative_path = file
+            .strip_prefix(relative_to)
+            .expect("source files are below their import base")
+            .to_str()
+            .ok_or_else(|| ImportError::invalid("relative path must be UTF-8"))
+            .map_err(|error| error.at_document(number))?;
+        #[cfg(windows)]
+        let relative_path = relative_path.replace('\\', "/");
+        #[cfg(not(windows))]
+        let relative_path = relative_path.to_owned();
+        validate_path(&relative_path).map_err(|error| error.at_document(number))?;
+        let staged_path = directory.path().join(number.to_string());
+        let sha256 = copy_local_document(
+            file,
+            &staged_path,
+            &mut buffer,
+            &mut remaining,
+            relative_path.len(),
+        )
+        .map_err(|error| error.at_document(number))?;
+        documents.push(Document {
+            relative_path,
+            sha256,
+            staged_path,
+        });
+        Ok::<_, ImportError>(())
+    };
+    if metadata.is_file() {
+        if !source
+            .file_name()
+            .is_some_and(|name| is_markdown(name.as_encoded_bytes()))
+        {
+            return Err(ImportError::invalid("path must name a .md file"));
+        }
+        stage(&source)?;
+    } else {
+        let read_dir = |path: &Path| {
+            fs::read_dir(path).map_err(|_| ImportError::invalid("cannot read a local directory"))
+        };
+        let mut stack = vec![read_dir(&source)?];
+        while let Some(directory) = stack.last_mut() {
+            let Some(entry) = directory.next() else {
+                stack.pop();
+                continue;
+            };
+            let unreadable =
+                |_| ImportError::invalid("cannot read an entry in the local directory");
+            let entry = entry.map_err(unreadable)?;
+            let kind = entry.file_type().map_err(unreadable)?;
+            if !kind.is_dir()
+                && !(kind.is_file() && is_markdown(entry.file_name().as_encoded_bytes()))
+            {
+                continue;
+            }
+            // Windows junctions and other reparse points can look like normal
+            // directories or files in FileType.
+            #[cfg(windows)]
+            if is_link(&entry.metadata().map_err(unreadable)?) {
+                continue;
+            }
+            if kind.is_dir() {
+                stack.push(read_dir(&entry.path())?);
+            } else {
+                stage(&entry.path())?;
+            }
+        }
+        if documents.is_empty() {
+            return Err(ImportError::invalid(
+                "the local directory contains no Markdown files",
+            ));
+        }
+    }
+    Ok(Batch {
+        documents,
+        _directory: directory,
+    })
+}
+
+fn staging_directory(stage_root: &Path) -> Result<TempDir, ImportError> {
+    tempfile::Builder::new()
+        .prefix("import-")
+        .tempdir_in(stage_root)
+        .map_err(|source| ImportError::Storage {
+            operation: "create the import staging directory",
+            source,
+        })
+}
+
+fn is_markdown(name: &[u8]) -> bool {
+    name.iter()
+        .rposition(|&byte| byte == b'.')
+        .is_some_and(|dot| dot != 0 && name[dot + 1..].eq_ignore_ascii_case(b"md"))
+}
+
+fn is_link(metadata: &Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        metadata.is_symlink()
+    }
+}
+
+fn copy_local_document(
+    source: &Path,
+    staged: &Path,
+    buffer: &mut [u8],
+    remaining: &mut usize,
+    path_bytes: usize,
+) -> Result<String, ImportError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let unreadable = |_| ImportError::invalid("cannot read the local Markdown file");
+    let mut input = options.open(source).map_err(unreadable)?;
+    let metadata = input.metadata().map_err(unreadable)?;
+    if !metadata.is_file() || is_link(&metadata) {
+        return Err(ImportError::invalid(
+            "the local Markdown source is not a regular file",
+        ));
+    }
+    *remaining = remaining
+        .checked_sub(path_bytes)
+        .ok_or(ImportError::PayloadTooLarge)?;
+    if metadata.len() > *remaining as u64 {
+        return Err(ImportError::PayloadTooLarge);
+    }
+    let mut output = fs::File::create_new(staged).map_err(|source| ImportError::Storage {
+        operation: "create a staged Markdown document",
+        source,
+    })?;
+    let mut utf8 = Utf8Tail::default();
+    let mut hash = Sha256::new();
+    loop {
+        let read = input.read(buffer).map_err(unreadable)?;
+        if read == 0 {
+            break;
+        }
+        *remaining = remaining
+            .checked_sub(read)
+            .ok_or(ImportError::PayloadTooLarge)?;
+        let chunk = &buffer[..read];
+        utf8.check(chunk)?;
+        hash.update(chunk);
+        output
+            .write_all(chunk)
+            .map_err(|source| ImportError::Storage {
+                operation: "write a staged Markdown document",
+                source,
+            })?;
+    }
+    finish_document(utf8, hash)
+}
+
 async fn read_path(mut field: Field<'_>) -> Result<String, ImportError> {
     let mut bytes = Vec::new();
     while let Some(chunk) = field.chunk().await.map_err(ImportError::multipart)? {
@@ -265,6 +465,10 @@ async fn write_document(mut field: Field<'_>, file: &mut File) -> Result<String,
                 source,
             })?;
     }
+    finish_document(utf8, hash)
+}
+
+fn finish_document(utf8: Utf8Tail, hash: Sha256) -> Result<String, ImportError> {
     if utf8.len != 0 {
         return Err(ImportError::invalid("file must be UTF-8"));
     }

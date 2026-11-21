@@ -2723,6 +2723,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "caseless",
+ "futures-util",
  "libc",
  "pulldown-cmark",
  "qdrant-edge",

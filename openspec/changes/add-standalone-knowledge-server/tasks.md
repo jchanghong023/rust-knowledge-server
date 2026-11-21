@@ -30,6 +30,22 @@
 
 ## 4. 部署验收
 
+### CentOS 7 运行与发布
+
+使用普通账号管理后台服务：
+
+```sh
+./rust-knowledge-server start
+./rust-knowledge-server status
+./rust-knowledge-server stop
+```
+
+`start` 支持 `--listen` 等启动参数（见 `./rust-knowledge-server --help`）。日志位于 `/dev/shm/rust-knowledge-server/daemon.log`。后台进程退出后不会自动重启。
+
+推送 `v<主版本>.<次版本>.<修订号>` 标签会触发 [Release CentOS 7](../../../.github/workflows/release.yml) 工作流，只构建和发布 CentOS 7 x64 压缩包。手动运行该工作流只上传 Actions 产物，不创建 GitHub Release。目标机手动构建见 [CentOS 7 构建脚本](../../../release/build-centos7.sh)。
+
+### 目标环境验收
+
 执行 4.1、4.2 时，服务启动不继承 `OMP_OFFLINE=1`，也不传模型参数。
 
 - [ ] 4.1 在干净的 Windows x64 环境与 CentOS 7 x64 目标服务器直接运行最终发布文件，关闭 Embedding 和 Rerank，以真实浏览器整批导入操作者提供的全部 Markdown 语料，不用抽样替代；源文件只读，整批验收不进日常 CI。导入前选定查询及预期原文、相对路径和行号；导入后和同一数据根进程重启后须找回预期证据，操作记录须保留。Windows 验证固定主目录路径与本地持久化。CentOS 7 由验收人员手工验证 glibc 2.17、运行依赖、单文件离线启动、Edge 写入及重开、范围 IDF、非 root 使用固定 tmpfs、占用或重定向路径被拒且不回退、tmpfs 空间不足时不替换旧版本；再用批准的隔离验收环境验证 shm 清空后空库启动、旧审计不复现，可重新建库并导入。两端记录导入耗时和数据根峰值占用，并确认无附带数据库进程或其他分发文件。
@@ -39,4 +55,4 @@
   - 核对自报工号与活动记录获准在同一 Web 访问范围内共享；验证范围内未登记访客可查看，范围外无法访问。
 - [ ] 4.3 在获准的 CentOS 7 x64 目标服务器，由普通启动账号使用已有的 `OMP_OFFLINE=1` 环境和 Claude Code 网关配置，分别直接运行最终发布文件及使用 `start`；不传任何模型参数，不新增服务配置，不重新录入密钥。只导入获准发送至配置网关的代表性 Markdown；确认真实 Embedding 已生成可用的 4096 维索引，并在 Web 与原生 MCP 中以预选查询核对原文来源。Web 以响应状态确认实际混合检索和精排；MCP 使用可与该次查询对应的脱敏网关记录及结果证据确认模型参与，不要求 MCP 返回检索诊断。记录脱敏验收证据，不记录 Token 或请求正文，不以模型质量评分作为门槛；与 4.1、4.2 的无模型验证分别记录。
 
-发布验证证据见 [README](../../../README.md)；现有验证记录不代表 4.1–4.3 已完成。
+本地验证不替代 4.1–4.3 的目标环境验收。

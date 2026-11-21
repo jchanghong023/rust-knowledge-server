@@ -7,6 +7,7 @@ publish = false
 [dependencies]
 axum = { version = "0.8", features = ["multipart"] }
 caseless = "0.2.2"
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 pulldown-cmark = { version = "0.13", default-features = false }
 qdrant-edge = "=0.9.0"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }

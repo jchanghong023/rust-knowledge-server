@@ -5,6 +5,7 @@ use std::{
     fmt,
     io::{self, Write},
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use qdrant_edge::{
@@ -137,12 +138,82 @@ pub(crate) struct SearchReply {
     pub(crate) name: Option<String>,
 }
 
+#[derive(Default)]
+struct SearchTiming {
+    snapshot: Duration,
+    shards: usize,
+    embedding_check: Duration,
+    embedding: Duration,
+    retrieval: Duration,
+    stages: RetrievalTiming,
+    rerank: Duration,
+}
+
+#[derive(Default)]
+struct RetrievalTiming {
+    shard_open: Duration,
+    exact: Duration,
+    bm25: Duration,
+    dense: Duration,
+    edge_fusion: Duration,
+    evidence: Duration,
+}
+
+fn measure<T>(elapsed: &mut Duration, work: impl FnOnce() -> T) -> T {
+    let start = Instant::now();
+    let result = work();
+    *elapsed += start.elapsed();
+    result
+}
+
 pub(crate) async fn search(
     catalog: &Catalog,
     request: SearchRequest,
     embedding: Option<Arc<Embedding>>,
     rerank: Option<&Rerank>,
     fusion: FusionMode,
+) -> Result<SearchReply, SearchError> {
+    let start = Instant::now();
+    let mut timing = SearchTiming::default();
+    let result = run_search(catalog, request, embedding, rerank, fusion, &mut timing).await;
+    let total = start.elapsed();
+    let (status, hits) = match &result {
+        Ok(reply) if reply.status == Status::NoPublishedIndex => ("no_published_index", 0),
+        Ok(reply) => ("ok", reply.matches.len()),
+        Err(SearchError::InvalidInput(_)) => ("invalid_input", 0),
+        Err(SearchError::LibraryNotFound) => ("library_not_found", 0),
+        Err(SearchError::Store) => ("store_error", 0),
+    };
+    let stages = timing.stages;
+    let _ = writeln!(
+        io::stderr().lock(),
+        "search_timing status={status} hits={hits} shards={} total_us={} snapshot_us={} \
+         embedding_check_us={} embedding_us={} retrieval_us={} shard_open_us={} exact_us={} \
+         bm25_us={} dense_us={} edge_fusion_us={} evidence_us={} rerank_us={}",
+        timing.shards,
+        total.as_micros(),
+        timing.snapshot.as_micros(),
+        timing.embedding_check.as_micros(),
+        timing.embedding.as_micros(),
+        timing.retrieval.as_micros(),
+        stages.shard_open.as_micros(),
+        stages.exact.as_micros(),
+        stages.bm25.as_micros(),
+        stages.dense.as_micros(),
+        stages.edge_fusion.as_micros(),
+        stages.evidence.as_micros(),
+        timing.rerank.as_micros(),
+    );
+    result
+}
+
+async fn run_search(
+    catalog: &Catalog,
+    request: SearchRequest,
+    embedding: Option<Arc<Embedding>>,
+    rerank: Option<&Rerank>,
+    fusion: FusionMode,
+    timing: &mut SearchTiming,
 ) -> Result<SearchReply, SearchError> {
     let SearchRequest {
         query,
@@ -172,12 +243,14 @@ pub(crate) async fn search(
     }
 
     // Pin the whole scope before opening any shard or awaiting any model.
-    let snapshot = catalog
-        .snapshot(library.as_deref())
-        .map_err(|error| match error {
-            CatalogError::NotFound => SearchError::LibraryNotFound,
-            _ => SearchError::Store,
-        })?;
+    let snapshot = measure(&mut timing.snapshot, || {
+        catalog.snapshot(library.as_deref())
+    })
+    .map_err(|error| match error {
+        CatalogError::NotFound => SearchError::LibraryNotFound,
+        _ => SearchError::Store,
+    })?;
+    timing.shards = snapshot.len();
     let scope = Scope { library, path };
     if snapshot.is_empty() {
         return Ok(SearchReply {
@@ -196,16 +269,21 @@ pub(crate) async fn search(
         .transpose()?;
 
     let (snapshot, filter, semantic) = if let Some(embedding) = embedding {
-        let (snapshot, filter, eligible, embedding) = tokio::task::spawn_blocking(move || {
+        let start = Instant::now();
+        let checked = tokio::task::spawn_blocking(move || {
             let eligible = embedding_versions(&snapshot, filter.as_ref(), &embedding)?;
             Ok::<_, SearchError>((snapshot, filter, eligible, embedding))
         })
-        .await
-        .map_err(|_| SearchError::Store)??;
+        .await;
+        timing.embedding_check = start.elapsed();
+        let (snapshot, filter, eligible, embedding) = checked.map_err(|_| SearchError::Store)??;
         let semantic = if eligible.is_empty() {
             None
         } else {
-            match embedding.embed(&[&query]).await {
+            let start = Instant::now();
+            let embedded = embedding.embed(&[&query]).await;
+            timing.embedding = start.elapsed();
+            match embedded {
                 Ok(vectors) => match <[Vec<f32>; 1]>::try_from(vectors) {
                     Ok([vector]) if usable_embedding(&vector) => Some((eligible, vector)),
                     _ => {
@@ -231,13 +309,26 @@ pub(crate) async fn search(
     };
     // The runtime bounds its blocking pool. Keep each batch of Edge work together
     // rather than scheduling a worker per library or per retrieval branch.
-    let (query, name, mut matches) = tokio::task::spawn_blocking(move || {
+    let start = Instant::now();
+    let retrieved = tokio::task::spawn_blocking(move || {
         let name = query_name(&query);
-        let matches = retrieve(&snapshot, &query, name.as_deref(), filter, semantic, fusion)?;
-        Ok::<_, SearchError>((query, name, matches))
+        let mut stages = RetrievalTiming::default();
+        let matches = retrieve(
+            &snapshot,
+            &query,
+            name.as_deref(),
+            filter,
+            semantic,
+            fusion,
+            &mut stages,
+        );
+        (query, name, matches, stages)
     })
-    .await
-    .map_err(|_| SearchError::Store)??;
+    .await;
+    timing.retrieval = start.elapsed();
+    let (query, name, matches, stages) = retrieved.map_err(|_| SearchError::Store)?;
+    timing.stages = stages;
+    let mut matches = matches?;
 
     let mut reranked = false;
     if let Some(rerank) = rerank.filter(|_| !matches.is_empty()) {
@@ -247,7 +338,10 @@ pub(crate) async fn search(
         for (document, evidence) in documents.iter_mut().zip(window.iter()) {
             *document = &evidence.text;
         }
-        match rerank.scores(&query, &documents[..window_len]).await {
+        let start = Instant::now();
+        let scores = rerank.scores(&query, &documents[..window_len]).await;
+        timing.rerank = start.elapsed();
+        match scores {
             Ok(mut scores) => {
                 rerank_window(window, &mut scores);
                 reranked = true;
@@ -369,6 +463,7 @@ fn retrieve(
     filter: Option<Filter>,
     semantic: Option<(Vec<usize>, Vec<f32>)>,
     fusion: FusionMode,
+    timing: &mut RetrievalTiming,
 ) -> Result<Vec<Evidence>, SearchError> {
     let exact_filter = name
         .map(|name| {
@@ -430,14 +525,16 @@ fn retrieve(
     let mut local = HashMap::new();
     let mut points = Vec::with_capacity(BRANCH_LIMIT);
     for (library, (_, version)) in snapshot.iter().enumerate() {
-        let shard = version.open().map_err(|_| SearchError::Store)?;
+        let shard =
+            measure(&mut timing.shard_open, || version.open()).map_err(|_| SearchError::Store)?;
         if let Some(exact) = &exact_filter {
-            let groups = shard
-                .query_groups(grouped(QueryRequest {
+            let groups = measure(&mut timing.exact, || {
+                shard.query_groups(grouped(QueryRequest {
                     filter: Some(exact.clone()),
                     ..QueryRequest::new(BRANCH_LIMIT)
                 }))
-                .map_err(|_| SearchError::Store)?;
+            })
+            .map_err(|_| SearchError::Store)?;
             for point in groups.into_iter().flat_map(|group| group.hits) {
                 let PointId::NumId(id) = point.id else {
                     return Err(SearchError::Store);
@@ -453,8 +550,8 @@ fn retrieve(
             .as_ref()
             .filter(|_| eligible.binary_search(&library).is_ok());
         if let (FusionMode::Edge, Some(keyword), Some(dense)) = (fusion, keyword.as_ref(), dense) {
-            let groups = shard
-                .query_groups(grouped(QueryRequest {
+            let groups = measure(&mut timing.edge_fusion, || {
+                shard.query_groups(grouped(QueryRequest {
                     prefetches: vec![
                         Prefetch {
                             query: Some(keyword.clone()),
@@ -474,7 +571,8 @@ fn retrieve(
                     filter: filter.clone(),
                     ..QueryRequest::new(BRANCH_LIMIT)
                 }))
-                .map_err(|_| SearchError::Store)?;
+            })
+            .map_err(|_| SearchError::Store)?;
             for point in groups.into_iter().flat_map(|group| group.hits) {
                 let PointId::NumId(id) = point.id else {
                     return Err(SearchError::Store);
@@ -487,16 +585,20 @@ fn retrieve(
                 local.insert(id, candidate);
             }
         } else {
-            for (scoring, params) in [(keyword.as_ref(), idf.as_ref()), (dense, None)] {
+            for (scoring, params, elapsed) in [
+                (keyword.as_ref(), idf.as_ref(), &mut timing.bm25),
+                (dense, None, &mut timing.dense),
+            ] {
                 let Some(scoring) = scoring else { continue };
-                let groups = shard
-                    .query_groups(grouped(QueryRequest {
+                let groups = measure(elapsed, || {
+                    shard.query_groups(grouped(QueryRequest {
                         query: Some(scoring.clone()),
                         filter: filter.clone(),
                         params: params.cloned(),
                         ..QueryRequest::new(BRANCH_LIMIT)
                     }))
-                    .map_err(|_| SearchError::Store)?;
+                })
+                .map_err(|_| SearchError::Store)?;
                 points.extend(groups.into_iter().flat_map(|group| group.hits));
                 // Edge sorts groups by their best hit, not all hits globally.
                 // Restore branch-wide score order before converting scores to ranks.
@@ -535,7 +637,9 @@ fn retrieve(
         // Later shards cannot add a vote to points from this shard.
         best.truncate(RESULT_LIMIT);
     }
-    load_evidence(snapshot, &best, name)
+    measure(&mut timing.evidence, || {
+        load_evidence(snapshot, &best, name)
+    })
 }
 
 fn location_order(left: &Candidate, right: &Candidate) -> Ordering {
