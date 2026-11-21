@@ -1,9 +1,10 @@
 use std::{
     cmp::Ordering,
-    collections::{HashMap, hash_map::Entry},
+    collections::HashMap,
     error::Error,
     fmt,
     io::{self, Write},
+    ops::Range,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -22,12 +23,16 @@ use uuid::Uuid;
 use crate::{
     catalog::{Catalog, CatalogError, Snapshot},
     import::validate_path,
-    index::{
-        EXACT_FIELD, KEYWORD_VECTOR, Passage, SCOPE_FIELD, SEMANTIC_VECTOR, bm25, usable_embedding,
-    },
+    index::{EXACT_FIELD, KEYWORD_VECTOR, SCOPE_FIELD, SEMANTIC_VECTOR, bm25, usable_embedding},
     model_http::{Embedding, ModelError, Rerank},
-    technical::query_name,
 };
+
+mod literal;
+mod page;
+
+pub(crate) use page::{Page, page};
+
+use literal::LiteralQuery;
 
 const MAX_QUERY_BYTES: usize = 4096;
 const BRANCH_LIMIT: usize = 32;
@@ -35,6 +40,7 @@ const PASSAGES_PER_FILE_PER_BRANCH: usize = 2;
 const RESULT_LIMIT: usize = 16;
 const RERANK_LIMIT: usize = 8;
 const RRF_K: usize = 60;
+const LITERAL_BATCH: usize = 32;
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum FusionMode {
@@ -58,6 +64,8 @@ pub(crate) struct SearchRequest {
     pub(crate) query: String,
     pub(crate) library: Option<String>,
     pub(crate) path: Option<String>,
+    #[serde(default)]
+    pub(crate) strict: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -97,6 +105,7 @@ pub(crate) enum Status {
 pub(crate) enum Retrieval {
     Keyword,
     Hybrid,
+    Literal,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, JsonSchema)]
@@ -104,6 +113,24 @@ pub(crate) enum Retrieval {
 pub(crate) enum Category {
     Exact,
     Related,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum MatchTier {
+    Related,
+    Identifier,
+    Topic,
+    TargetTopic,
+    DirectTopic,
+    ExactNavigation,
+    Exact,
+    ExactDetail,
+}
+
+impl MatchTier {
+    fn is_exact(self) -> bool {
+        self >= Self::ExactNavigation
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
@@ -117,6 +144,10 @@ pub(crate) struct Evidence {
     pub(crate) category: Category,
     #[serde(skip)]
     pub(crate) source: Source,
+    #[serde(skip)]
+    pub(crate) anchor: Option<Range<usize>>,
+    #[serde(skip)]
+    tier: MatchTier,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -134,8 +165,6 @@ pub(crate) struct SearchReply {
     pub(crate) matches: Vec<Evidence>,
     pub(crate) retrieval: Retrieval,
     pub(crate) reranked: bool,
-    #[serde(skip)]
-    pub(crate) name: Option<String>,
 }
 
 #[derive(Default)]
@@ -173,13 +202,35 @@ pub(crate) async fn search(
     rerank: Option<&Rerank>,
     fusion: FusionMode,
 ) -> Result<SearchReply, SearchError> {
+    execute(catalog, request, embedding, rerank, fusion, None)
+        .await
+        .map(|page| page.reply)
+}
+
+async fn execute(
+    catalog: &Catalog,
+    request: SearchRequest,
+    embedding: Option<Arc<Embedding>>,
+    rerank: Option<&Rerank>,
+    fusion: FusionMode,
+    paging: Option<page::Paging>,
+) -> Result<Page, SearchError> {
     let start = Instant::now();
     let mut timing = SearchTiming::default();
-    let result = run_search(catalog, request, embedding, rerank, fusion, &mut timing).await;
+    let result = run_search(
+        catalog,
+        request,
+        embedding,
+        rerank,
+        fusion,
+        paging,
+        &mut timing,
+    )
+    .await;
     let total = start.elapsed();
     let (status, hits) = match &result {
-        Ok(reply) if reply.status == Status::NoPublishedIndex => ("no_published_index", 0),
-        Ok(reply) => ("ok", reply.matches.len()),
+        Ok(page) if page.reply.status == Status::NoPublishedIndex => ("no_published_index", 0),
+        Ok(page) => ("ok", page.reply.matches.len()),
         Err(SearchError::InvalidInput(_)) => ("invalid_input", 0),
         Err(SearchError::LibraryNotFound) => ("library_not_found", 0),
         Err(SearchError::Store) => ("store_error", 0),
@@ -213,12 +264,14 @@ async fn run_search(
     embedding: Option<Arc<Embedding>>,
     rerank: Option<&Rerank>,
     fusion: FusionMode,
+    mut paging: Option<page::Paging>,
     timing: &mut SearchTiming,
-) -> Result<SearchReply, SearchError> {
+) -> Result<Page, SearchError> {
     let SearchRequest {
         query,
         library,
         path,
+        strict,
     } = request;
     if query
         .trim_matches(|ch: char| ch.is_whitespace() || ch == '\u{feff}')
@@ -247,20 +300,29 @@ async fn run_search(
         catalog.snapshot(library.as_deref())
     })
     .map_err(|error| match error {
+        CatalogError::NotFound if paging.as_ref().is_some_and(page::Paging::is_continuation) => {
+            page::STALE_CURSOR
+        }
         CatalogError::NotFound => SearchError::LibraryNotFound,
         _ => SearchError::Store,
     })?;
     timing.shards = snapshot.len();
     let scope = Scope { library, path };
+    if let Some(paging) = &mut paging {
+        paging.bind(&query, &scope, strict, fusion, &snapshot)?;
+    }
     if snapshot.is_empty() {
-        return Ok(SearchReply {
+        return Ok(Page::unpaged(SearchReply {
             scope,
             status: Status::NoPublishedIndex,
             matches: Vec::new(),
-            retrieval: Retrieval::Keyword,
+            retrieval: if strict {
+                Retrieval::Literal
+            } else {
+                Retrieval::Keyword
+            },
             reranked: false,
-            name: None,
-        });
+        }));
     }
     let filter = scope
         .path
@@ -268,6 +330,11 @@ async fn run_search(
         .map(|path| match_condition(SCOPE_FIELD, path).map(Filter::new_must))
         .transpose()?;
 
+    let replay_retrieval = paging
+        .as_ref()
+        .and_then(page::Paging::replay)
+        .map(|ranking| ranking.retrieval);
+    let embedding = embedding.filter(|_| !strict && replay_retrieval.is_none());
     let (snapshot, filter, semantic) = if let Some(embedding) = embedding {
         let start = Instant::now();
         let checked = tokio::task::spawn_blocking(move || {
@@ -302,7 +369,11 @@ async fn run_search(
         (snapshot, filter, None)
     };
 
-    let retrieval = if semantic.is_some() {
+    let retrieval = if let Some(retrieval) = replay_retrieval {
+        retrieval
+    } else if strict {
+        Retrieval::Literal
+    } else if semantic.is_some() {
         Retrieval::Hybrid
     } else {
         Retrieval::Keyword
@@ -311,27 +382,30 @@ async fn run_search(
     // rather than scheduling a worker per library or per retrieval branch.
     let start = Instant::now();
     let retrieved = tokio::task::spawn_blocking(move || {
-        let name = query_name(&query);
         let mut stages = RetrievalTiming::default();
         let matches = retrieve(
             &snapshot,
             &query,
-            name.as_deref(),
+            strict,
             filter,
             semantic,
             fusion,
+            paging,
             &mut stages,
         );
-        (query, name, matches, stages)
+        (query, matches, stages, snapshot)
     })
     .await;
     timing.retrieval = start.elapsed();
-    let (query, name, matches, stages) = retrieved.map_err(|_| SearchError::Store)?;
+    let (query, matches, stages, snapshot) = retrieved.map_err(|_| SearchError::Store)?;
     timing.stages = stages;
-    let mut matches = matches?;
+    let mut ranked = matches?;
+    let matches = &mut ranked.head;
 
     let mut reranked = false;
-    if let Some(rerank) = rerank.filter(|_| !matches.is_empty()) {
+    if let Some(rerank) =
+        rerank.filter(|_| !strict && replay_retrieval.is_none() && !matches.is_empty())
+    {
         let window_len = matches.len().min(RERANK_LIMIT);
         let window = &mut matches[..window_len];
         let mut documents = [""; RERANK_LIMIT];
@@ -343,20 +417,15 @@ async fn run_search(
         timing.rerank = start.elapsed();
         match scores {
             Ok(mut scores) => {
-                rerank_window(window, &mut scores);
+                let exact_count =
+                    window.partition_point(|evidence| evidence.category == Category::Exact);
+                rerank_window(&mut window[exact_count..], &mut scores[exact_count..]);
                 reranked = true;
             }
             Err(error) => log_model_failure("rerank", error),
         }
     }
-    Ok(SearchReply {
-        scope,
-        status: Status::Ok,
-        matches,
-        retrieval,
-        reranked,
-        name,
-    })
+    ranked.finish(scope, retrieval, reranked, snapshot)
 }
 
 fn log_model_failure(operation: &str, kind: ModelError) {
@@ -403,69 +472,81 @@ fn embedding_versions(
     Ok(eligible)
 }
 
-#[derive(Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-struct Location {
+#[derive(Deserialize)]
+struct PassageText {
+    text: String,
     path: String,
     line_start: usize,
+    line_end: usize,
+    sha256: String,
     byte_start: usize,
 }
 
 struct Candidate {
     library: usize,
     id: u64,
-    location: Location,
-    category: Category,
+    passage: PassageText,
+    anchor: Option<Range<usize>>,
+    tier: MatchTier,
     rank_score: f64,
 }
 
 impl Candidate {
-    fn from_payload(
-        library: usize,
-        id: u64,
-        payload: Option<Payload>,
-        name: Option<&str>,
-    ) -> Result<Self, SearchError> {
-        let payload = payload.ok_or(SearchError::Store)?;
-        let category = if let Some(name) = name {
-            let names = payload
-                .0
-                .get(EXACT_FIELD)
-                .and_then(Value::as_array)
-                .ok_or(SearchError::Store)?;
-            category(names.iter().filter_map(Value::as_str), Some(name))
+    fn category(&self) -> Category {
+        if self.tier.is_exact() {
+            Category::Exact
         } else {
             Category::Related
-        };
-        let location =
-            serde_json::from_value(Value::Object(payload.0)).map_err(|_| SearchError::Store)?;
-        Ok(Self {
-            library,
-            id,
-            location,
-            category,
-            rank_score: 0.0,
-        })
+        }
+    }
+
+    fn into_evidence(self, snapshot: &Snapshot) -> Evidence {
+        let (library, version) = &snapshot[self.library];
+        let (library_id, version_id) = version.identity();
+        Evidence {
+            category: self.category(),
+            text: self.passage.text,
+            library: library.clone(),
+            path: self.passage.path,
+            line_start: self.passage.line_start,
+            line_end: self.passage.line_end,
+            sha256: self.passage.sha256,
+            source: Source {
+                library: library_id,
+                version: version_id,
+                point: self.id,
+                byte_start: self.passage.byte_start,
+            },
+            anchor: self.anchor,
+            tier: self.tier,
+        }
     }
 }
 
-fn category<'a>(mut names: impl Iterator<Item = &'a str>, query: Option<&str>) -> Category {
-    if query.is_some_and(|name| names.any(|candidate| candidate == name)) {
-        Category::Exact
-    } else {
-        Category::Related
+fn passage(payload: Option<Payload>) -> Result<PassageText, SearchError> {
+    let payload = payload.ok_or(SearchError::Store)?;
+    let passage: PassageText =
+        serde_json::from_value(Value::Object(payload.0)).map_err(|_| SearchError::Store)?;
+    if passage.text.is_empty() || passage.byte_start.checked_add(passage.text.len()).is_none() {
+        return Err(SearchError::Store);
     }
+    Ok(passage)
 }
 
 fn retrieve(
     snapshot: &Snapshot,
     query: &str,
-    name: Option<&str>,
+    strict: bool,
     filter: Option<Filter>,
     semantic: Option<(Vec<usize>, Vec<f32>)>,
     fusion: FusionMode,
+    paging: Option<page::Paging>,
     timing: &mut RetrievalTiming,
-) -> Result<Vec<Evidence>, SearchError> {
-    let exact_filter = name
+) -> Result<page::Ranked, SearchError> {
+    let mut literal = LiteralQuery::new(query, strict);
+    let exact_filter = literal
+        .posting
+        .as_deref()
         .map(|name| {
             let mut filter = filter.clone().unwrap_or_default();
             filter
@@ -475,13 +556,18 @@ fn retrieve(
             Ok::<_, SearchError>(filter)
         })
         .transpose()?;
-    let sparse = bm25().map_err(|_| SearchError::Store)?.embed_query(query);
-    let keyword = (!sparse.indices.is_empty()).then(|| {
-        ScoringQuery::Vector(QueryEnum::Nearest(NamedQuery::new(
-            sparse.into(),
-            KEYWORD_VECTOR,
-        )))
-    });
+    let replay = paging.as_ref().and_then(page::Paging::replay).cloned();
+    let keyword = if strict || replay.is_some() {
+        None
+    } else {
+        let sparse = bm25().map_err(|_| SearchError::Store)?.embed_query(query);
+        (!sparse.indices.is_empty()).then(|| {
+            ScoringQuery::Vector(QueryEnum::Nearest(NamedQuery::new(
+                sparse.into(),
+                KEYWORD_VECTOR,
+            )))
+        })
+    };
     let idf = filter.as_ref().map(|scope| SearchParams {
         idf: Some(IdfParams::Corpus(IdfCorpusParams {
             corpus: scope.clone(),
@@ -498,22 +584,24 @@ fn retrieve(
         ),
         None => (Vec::new(), None),
     };
-    let mut payload_paths = vec!["path", "line_start", "byte_start"];
-    if name.is_some() {
-        payload_paths.push(EXACT_FIELD);
-    }
-    let metadata = WithPayloadInterface::Fields(
-        payload_paths
-            .into_iter()
-            .map(str::parse)
-            .collect::<Result<_, _>>()
-            .map_err(|_| SearchError::Store)?,
+    let text_fields = WithPayloadInterface::Fields(
+        [
+            "text",
+            "path",
+            "line_start",
+            "line_end",
+            "sha256",
+            "byte_start",
+        ]
+        .into_iter()
+        .map(|field| field.parse().expect("constant Edge payload field"))
+        .collect(),
     );
     let path: JsonPath = "path".parse().expect("constant Edge payload path");
     let grouped = |request: QueryRequest| {
         GroupRequest::new(
             QueryRequest {
-                with_payload: metadata.clone(),
+                with_payload: false.into(),
                 ..request
             },
             path.clone(),
@@ -521,30 +609,16 @@ fn retrieve(
             PASSAGES_PER_FILE_PER_BRANCH,
         )
     };
-    let mut best = Vec::with_capacity(RESULT_LIMIT + BRANCH_LIMIT * 3);
-    let mut local = HashMap::new();
-    let mut points = Vec::with_capacity(BRANCH_LIMIT);
-    for (library, (_, version)) in snapshot.iter().enumerate() {
-        let shard =
-            measure(&mut timing.shard_open, || version.open()).map_err(|_| SearchError::Store)?;
-        if let Some(exact) = &exact_filter {
-            let groups = measure(&mut timing.exact, || {
-                shard.query_groups(grouped(QueryRequest {
-                    filter: Some(exact.clone()),
-                    ..QueryRequest::new(BRANCH_LIMIT)
-                }))
-            })
-            .map_err(|_| SearchError::Store)?;
-            for point in groups.into_iter().flat_map(|group| group.hits) {
-                let PointId::NumId(id) = point.id else {
-                    return Err(SearchError::Store);
-                };
-                let candidate = Candidate::from_payload(library, id, point.payload, name)?;
-                if candidate.category != Category::Exact {
-                    return Err(SearchError::Store);
-                }
-                local.insert(candidate.id, candidate);
-            }
+    let mut selection = page::Selection::new(paging);
+    let mut points = Vec::new();
+    let mut ranks = |library: usize,
+                     shard: &qdrant_edge::EdgeShard,
+                     local: &mut HashMap<u64, f64>,
+                     timing: &mut RetrievalTiming|
+     -> Result<(), SearchError> {
+        if let Some(replay) = &replay {
+            replay.ranks(library, local);
+            return Ok(());
         }
         let dense = dense
             .as_ref()
@@ -580,9 +654,7 @@ fn retrieve(
                 if !point.score.is_finite() {
                     return Err(SearchError::Store);
                 }
-                let mut candidate = Candidate::from_payload(library, id, point.payload, name)?;
-                candidate.rank_score = f64::from(point.score);
-                local.insert(id, candidate);
+                local.insert(id, f64::from(point.score));
             }
         } else {
             for (scoring, params, elapsed) in [
@@ -616,100 +688,210 @@ fn retrieve(
                     let PointId::NumId(id) = point.id else {
                         return Err(SearchError::Store);
                     };
-                    let candidate = match local.entry(id) {
-                        Entry::Occupied(entry) => entry.into_mut(),
-                        Entry::Vacant(entry) => {
-                            entry.insert(Candidate::from_payload(library, id, point.payload, name)?)
-                        }
-                    };
-                    candidate.rank_score += 1.0 / (RRF_K + rank) as f64;
+                    *local.entry(id).or_default() += 1.0 / (RRF_K + rank) as f64;
                 }
             }
         }
-        best.extend(local.drain().map(|(_, candidate)| candidate));
-        best.sort_unstable_by(|left, right| {
-            left.category
-                .cmp(&right.category)
-                .then_with(|| right.rank_score.total_cmp(&left.rank_score))
-                .then_with(|| snapshot[left.library].0.cmp(&snapshot[right.library].0))
-                .then_with(|| location_order(left, right))
-        });
-        // Later shards cannot add a vote to points from this shard.
-        best.truncate(RESULT_LIMIT);
-    }
-    measure(&mut timing.evidence, || {
-        load_evidence(snapshot, &best, name)
-    })
-}
-
-fn location_order(left: &Candidate, right: &Candidate) -> Ordering {
-    left.location
-        .cmp(&right.location)
-        .then(left.id.cmp(&right.id))
-}
-
-fn load_evidence(
-    snapshot: &Snapshot,
-    best: &[Candidate],
-    name: Option<&str>,
-) -> Result<Vec<Evidence>, SearchError> {
-    // Fetch raw text only for the final unique IDs, batched by pinned shard.
-    let mut by_library = (0..best.len()).collect::<Vec<_>>();
-    by_library.sort_unstable_by_key(|&rank| best[rank].library);
-    let mut evidence = (0..best.len()).map(|_| None).collect::<Vec<_>>();
-    for ranks in by_library.chunk_by(|&left, &right| best[left].library == best[right].library) {
-        let (library, version) = &snapshot[best[ranks[0]].library];
-        let shard = version.open().map_err(|_| SearchError::Store)?;
-        let ids = ranks
+        Ok(())
+    };
+    // An overflow cursor stores only point identity, not its path or score.
+    // Recover its key inside the pinned index, reusing the bounded rank branch
+    // for that shard when the main scan reaches it.
+    let mut boundary_ranks = None;
+    if let Some((version_id, id, category)) = selection.seek() {
+        let library = snapshot
             .iter()
-            .map(|&rank| PointId::NumId(best[rank].id))
-            .collect();
-        let records = shard
-            .retrieve(RetrieveRequest::new(ids))
+            .position(|(_, version)| version.identity().1 == version_id)
+            .ok_or(page::STALE_CURSOR)?;
+        let shard = measure(&mut timing.shard_open, || snapshot[library].1.open())
             .map_err(|_| SearchError::Store)?;
-        if records.len() != ranks.len() {
-            return Err(SearchError::Store);
+        let mut rank_score = 0.0;
+        if category == Category::Related {
+            let mut local = HashMap::new();
+            ranks(library, shard, &mut local, timing)?;
+            rank_score = local.get(&id).copied().unwrap_or_default();
+            boundary_ranks = Some((library, local));
         }
-        for (&rank, record) in ranks.iter().zip(records) {
-            let candidate = &best[rank];
-            let passage = Passage::from_payload(record.payload.ok_or(SearchError::Store)?)
-                .map_err(|_| SearchError::Store)?;
-            if record.id != PointId::NumId(candidate.id)
-                || candidate.category != category(passage.exact.iter().map(String::as_str), name)
-            {
-                return Err(SearchError::Store);
+        let mut request = RetrieveRequest::new(vec![PointId::NumId(id)]);
+        request.with_payload = Some(text_fields.clone());
+        let mut records = shard.retrieve(request).map_err(|_| SearchError::Store)?;
+        let record = records.pop().ok_or(page::STALE_CURSOR)?;
+        let passage = passage(record.payload)?;
+        let (anchor, mut tier) = literal.verify(shard, id, &passage)?;
+        if category == Category::Related && tier.is_exact() {
+            tier = MatchTier::Related;
+        }
+        selection.set_boundary(Candidate {
+            library,
+            id,
+            passage,
+            anchor,
+            tier,
+            rank_score,
+        })?;
+    }
+    let mut local = HashMap::new();
+    for (library, (_, version)) in snapshot.iter().enumerate() {
+        let shard =
+            measure(&mut timing.shard_open, || version.open()).map_err(|_| SearchError::Store)?;
+        if boundary_ranks
+            .as_ref()
+            .is_some_and(|(ordinal, _)| *ordinal == library)
+        {
+            let (_, mut ranked) = boundary_ranks.take().expect("matching boundary ranks");
+            std::mem::swap(&mut local, &mut ranked);
+        } else {
+            ranks(library, shard, &mut local, timing)?;
+        }
+        selection.record_ranks(&local);
+        // Both modes derive exact membership only from the same scan. If there
+        // is no safe posting, verify the whole scope in bounded batches.
+        measure(&mut timing.exact, || {
+            let mut request = ScrollRequest {
+                filter: exact_filter.clone().or_else(|| filter.clone()),
+                limit: Some(LITERAL_BATCH),
+                with_payload: Some(text_fields.clone()),
+                ..ScrollRequest::new()
+            };
+            loop {
+                let (records, next) = shard
+                    .scroll(request.clone())
+                    .map_err(|_| SearchError::Store)?;
+                for record in records {
+                    let PointId::NumId(id) = record.id else {
+                        return Err(SearchError::Store);
+                    };
+                    let passage = passage(record.payload)?;
+                    let (anchor, tier) = literal.verify(shard, id, &passage)?;
+                    let rank_score = local.remove(&id);
+                    if tier.is_exact() || (!strict && (anchor.is_some() || rank_score.is_some())) {
+                        selection.consider(
+                            Candidate {
+                                library,
+                                id,
+                                passage,
+                                anchor,
+                                tier,
+                                rank_score: rank_score.unwrap_or_default(),
+                            },
+                            snapshot,
+                        );
+                    }
+                }
+                let Some(next) = next else {
+                    return Ok(());
+                };
+                request.offset = Some(next);
             }
-            let (library_id, version_id) = version.identity();
-            evidence[rank] = Some(Evidence {
-                text: passage.text,
-                library: library.clone(),
-                path: passage.path,
-                line_start: passage.line_start,
-                line_end: passage.line_end,
-                sha256: passage.sha256,
-                category: candidate.category,
-                source: Source {
-                    library: library_id,
-                    version: version_id,
-                    point: candidate.id,
-                    byte_start: passage.byte_start,
-                },
-            });
+        })?;
+        if local.is_empty() {
+            continue;
+        }
+        measure(&mut timing.evidence, || {
+            let mut request =
+                RetrieveRequest::new(local.keys().copied().map(PointId::NumId).collect());
+            request.with_payload = Some(text_fields.clone());
+            let records = shard.retrieve(request).map_err(|_| SearchError::Store)?;
+            for record in records {
+                let PointId::NumId(id) = record.id else {
+                    return Err(SearchError::Store);
+                };
+                let rank_score = local.remove(&id).ok_or(SearchError::Store)?;
+                let passage = passage(record.payload)?;
+                // Branch-only hits may still have a verified lexical anchor,
+                // but ranks cannot extend the shared scan's exact membership.
+                let (anchor, tier) = literal.verify(shard, id, &passage)?;
+                let tier = if tier.is_exact() {
+                    MatchTier::Related
+                } else {
+                    tier
+                };
+                selection.consider(
+                    Candidate {
+                        library,
+                        id,
+                        passage,
+                        anchor,
+                        tier,
+                        rank_score,
+                    },
+                    snapshot,
+                );
+            }
+            if local.is_empty() {
+                Ok(())
+            } else {
+                Err(SearchError::Store)
+            }
+        })?;
+    }
+    Ok(selection.finish(snapshot))
+}
+
+fn diverse_slot(
+    best: &[Candidate],
+    candidate: &Candidate,
+    snapshot: &Snapshot,
+) -> Option<(usize, Option<usize>)> {
+    let position =
+        best.partition_point(|other| candidate_order(other, candidate, snapshot).is_lt());
+    if position == RESULT_LIMIT {
+        return None;
+    }
+    if candidate.anchor.is_some() {
+        // A large repetitive reference file must not exhaust its literal tier.
+        let same_file = |(_, other): &(usize, &Candidate)| {
+            candidate.library == other.library
+                && candidate.passage.path == other.passage.path
+                && other.anchor.is_some()
+                && (candidate.tier == other.tier
+                    || (candidate.tier.is_exact() && other.tier.is_exact()))
+        };
+        if let Some((last_index, _)) = best
+            .iter()
+            .enumerate()
+            .filter(same_file)
+            .nth(PASSAGES_PER_FILE_PER_BRANCH - 1)
+        {
+            if last_index < position {
+                return None;
+            }
+            return Some((position, Some(last_index)));
         }
     }
-    evidence
-        .into_iter()
-        .map(|item| item.ok_or(SearchError::Store))
-        .collect()
+    Some((
+        position,
+        (best.len() == RESULT_LIMIT).then_some(RESULT_LIMIT - 1),
+    ))
+}
+
+fn candidate_order(left: &Candidate, right: &Candidate, snapshot: &Snapshot) -> Ordering {
+    right
+        .tier
+        .cmp(&left.tier)
+        .then_with(|| {
+            // The exact evidence tiers and source tie-break apply in both modes.
+            // Branch scores only order related results.
+            if left.tier.is_exact() {
+                Ordering::Equal
+            } else {
+                right.rank_score.total_cmp(&left.rank_score)
+            }
+        })
+        .then_with(|| snapshot[left.library].0.cmp(&snapshot[right.library].0))
+        .then_with(|| left.passage.path.cmp(&right.passage.path))
+        .then_with(|| left.passage.line_start.cmp(&right.passage.line_start))
+        .then_with(|| left.passage.byte_start.cmp(&right.passage.byte_start))
+        .then_with(|| left.id.cmp(&right.id))
 }
 
 fn rerank_window(window: &mut [Evidence], scores: &mut [f64]) {
     // Insertion sort is stable, in-place and bounded by RERANK_LIMIT. A point
-    // cannot cross its category boundary, and points outside the slice do not move.
+    // cannot cross the verified related-evidence tiers.
     for next in 1..window.len() {
         let mut position = next;
         while position > 0
-            && window[position].category == window[position - 1].category
+            && window[position].tier == window[position - 1].tier
             && scores[position] > scores[position - 1]
         {
             window.swap(position, position - 1);

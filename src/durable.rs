@@ -121,7 +121,7 @@ pub(crate) fn seal_version(build_dir: &Path, published_dir: &Path) -> io::Result
     commit_move(build_dir, published_dir, false).map_err(io::Error::from)
 }
 
-/// Check exact bytes and the required Edge layout without following links or repairing anything.
+/// Verify the sealed bytes, allowing only Edge's equivalent zero-padded bitmap capacities.
 /// Edge must not be invoked on an unverified published version: it can recreate absent files.
 pub(crate) fn verify_version(
     published_dir: &Path,
@@ -148,10 +148,18 @@ pub(crate) fn verify_version(
                     sha256,
                 },
             ) => {
-                if size != expected {
-                    return Err(invalid(path, "file size does not match integrity manifest"));
-                }
-                if hash_file(path, size, false, &mut buffer)? != sha256 {
+                let digest = if size == expected {
+                    hash_file(path, size, false, &mut buffer)?
+                } else {
+                    if !name.starts_with("segments/")
+                        || path.file_name() != Some(OsStr::new("flags_a.dat"))
+                        || !edge_flag_capacity_change(path, size, expected)?
+                    {
+                        return Err(invalid(path, "file size does not match integrity manifest"));
+                    }
+                    hash_resized_flags(path, size, expected, &mut buffer)?
+                };
+                if digest != sha256 {
                     return Err(invalid(path, "SHA-256 does not match integrity manifest"));
                 }
                 Ok(())
@@ -386,6 +394,86 @@ fn hash_file(path: &Path, size: u64, sync: bool, buffer: &mut [u8]) -> io::Resul
     Ok(hash.finalize().into())
 }
 
+fn edge_flag_capacity_change(path: &Path, actual: u64, sealed: u64) -> io::Result<bool> {
+    // Qdrant Edge 0.9.0 DynamicStoredFlags stores two native usize values:
+    // the logical bit length and the legacy active file ID (zero for flags_a).
+    // Its physical allocation differs only by the minimum for debug vs release.
+    const DEBUG_MIN: u64 = 128;
+    const RELEASE_MIN: u64 = 1024 * 1024;
+    const WORD: usize = std::mem::size_of::<usize>();
+    let smaller = actual.min(sealed);
+    if actual.max(sealed) != RELEASE_MIN || smaller < DEBUG_MIN {
+        return Ok(false);
+    }
+    let status = path.with_file_name("status.dat");
+    // The directory walk independently checks this file against its sealed hash.
+    let metadata = checked_metadata(&status)?;
+    if !metadata.is_file() || metadata.len() != (2 * WORD) as u64 {
+        return Ok(false);
+    }
+    let mut len = [0; WORD];
+    let mut active = [0; WORD];
+    let mut file = at(&status, "open Edge bitmap status", File::open(&status))?;
+    at(
+        &status,
+        "read Edge bitmap length",
+        file.read_exact(&mut len),
+    )?;
+    at(
+        &status,
+        "read Edge bitmap file ID",
+        file.read_exact(&mut active),
+    )?;
+    if usize::from_ne_bytes(active) != 0 {
+        return Ok(false);
+    }
+    let needed = (usize::from_ne_bytes(len) as u64).div_ceil(8);
+    Ok(needed
+        .checked_next_power_of_two()
+        .is_some_and(|capacity| capacity.max(DEBUG_MIN) == smaller))
+}
+
+fn hash_resized_flags(
+    path: &Path,
+    actual: u64,
+    sealed: u64,
+    buffer: &mut [u8],
+) -> io::Result<[u8; 32]> {
+    let mut file = at(path, "open Edge bitmap", File::open(path))?;
+    let mut hash = Sha256::new();
+    let mut common = actual.min(sealed);
+    while common != 0 {
+        let len = common.min(buffer.len() as u64) as usize;
+        let chunk = &mut buffer[..len];
+        at(path, "read Edge bitmap", file.read_exact(chunk))?;
+        hash.update(&*chunk);
+        common -= chunk.len() as u64;
+    }
+
+    let mut padding = actual.abs_diff(sealed);
+    if actual < sealed {
+        // Reconstruct exactly the old capacity before checking its sealed digest.
+        buffer.fill(0);
+    }
+    while padding != 0 {
+        let len = padding.min(buffer.len() as u64) as usize;
+        let chunk = &mut buffer[..len];
+        if actual > sealed {
+            at(path, "read Edge bitmap padding", file.read_exact(chunk))?;
+            if chunk.iter().any(|&byte| byte != 0) {
+                return Err(invalid(path, "Edge bitmap has nonzero capacity padding"));
+            }
+        } else {
+            hash.update(&*chunk);
+        }
+        padding -= chunk.len() as u64;
+    }
+    if at(path, "check Edge bitmap end", file.read(&mut buffer[..1]))? != 0 {
+        return Err(invalid(path, "index file changed size while hashing"));
+    }
+    Ok(hash.finalize().into())
+}
+
 fn checked_metadata(path: &Path) -> io::Result<Metadata> {
     let metadata = at(path, "read metadata", fs::symlink_metadata(path))?;
     if metadata.is_symlink() || is_reparse_point(&metadata) {
@@ -541,12 +629,10 @@ mod tests {
     use super::*;
     use crate::shard::Shard;
 
-    #[test]
-    fn sealed_edge_reopens_and_detects_same_length_damage() -> Result<(), Box<dyn Error>> {
-        let root = tempfile::tempdir()?;
+    fn seal_edge_fixture(root: &Path) -> Result<std::path::PathBuf, Box<dyn Error>> {
         let generation = Uuid::new_v4();
-        let build = root.path().join(format!(".build-{generation}"));
-        let published = root.path().join(generation.to_string());
+        let build = root.join(format!(".build-{generation}"));
+        let published = root.join(generation.to_string());
         let config = EdgeConfigBuilder::new()
             .vector(
                 "semantic",
@@ -579,6 +665,83 @@ mod tests {
         shard.flush()?;
         drop(shard);
         seal_version(&build, &published)?;
+        Ok(published)
+    }
+
+    #[test]
+    fn sealed_edge_reopens_after_flag_capacity_changes() -> Result<(), Box<dyn Error>> {
+        let root = tempfile::tempdir()?;
+        let published = seal_edge_fixture(root.path())?;
+        let manifest_path = published.join(MANIFEST);
+        let mut manifest = read_manifest(&published)?;
+        let name = manifest
+            .keys()
+            .find(|name| name.ends_with("/vector_storage-text/deleted/flags_a.dat"))
+            .expect("Edge persisted the sparse vector deletion bitmap")
+            .clone();
+        let flag = published.join(INDEX).join(&name);
+        let original = fs::read(&flag)?;
+        const DEBUG_SIZE: usize = 128;
+        const RELEASE_SIZE: usize = 1024 * 1024;
+        assert!(original.len() == DEBUG_SIZE || original.len() == RELEASE_SIZE);
+        assert!(original[DEBUG_SIZE..].iter().all(|&byte| byte == 0));
+        let short = &original[..DEBUG_SIZE];
+        let mut padded = vec![0; RELEASE_SIZE];
+        padded[..DEBUG_SIZE].copy_from_slice(short);
+
+        for (sealed, on_disk) in [(short, padded.as_slice()), (padded.as_slice(), short)] {
+            manifest.insert(
+                name.clone(),
+                Entry::File {
+                    size: sealed.len() as u64,
+                    sha256: Sha256::digest(sealed).into(),
+                },
+            );
+            let sealed_manifest = serde_json::to_vec(&manifest)?;
+            fs::write(&manifest_path, &sealed_manifest)?;
+            fs::write(&flag, on_disk)?;
+            let shard = Shard::published(published.clone());
+            let edge = shard.open().map_err(|error| error.to_string())?;
+            let records = edge.retrieve(qdrant_edge::RetrieveRequest::new(vec![1_u64.into()]))?;
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].payload.as_ref().unwrap().0["path"], "a.md");
+            drop(shard);
+            verify_version(&published)?;
+            assert_eq!(fs::read(&manifest_path)?, sealed_manifest);
+        }
+
+        manifest.insert(
+            name,
+            Entry::File {
+                size: DEBUG_SIZE as u64,
+                sha256: Sha256::digest(short).into(),
+            },
+        );
+        fs::write(&manifest_path, serde_json::to_vec(&manifest)?)?;
+        let last = padded.len() - 1;
+        padded[last] = 1;
+        fs::write(&flag, &padded)?;
+        let error = verify_version(&published)
+            .err()
+            .expect("nonzero padding must be rejected");
+        assert!(error.to_string().contains("flags_a.dat"));
+        padded[last] = 0;
+        padded[0] ^= 1;
+        fs::write(&flag, &padded)?;
+        let error = verify_version(&published)
+            .err()
+            .expect("damaged bitmap prefix must be rejected");
+        assert!(error.to_string().contains("SHA-256"));
+        padded[0] ^= 1;
+        fs::write(&flag, &padded[..RELEASE_SIZE - 1])?;
+        assert!(verify_version(&published).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn sealed_edge_reopens_and_detects_same_length_damage() -> Result<(), Box<dyn Error>> {
+        let root = tempfile::tempdir()?;
+        let published = seal_edge_fixture(root.path())?;
 
         // A killed Edge opener may leave an atomicwrites temp dir, but its contents
         // were never published and reopening must not remove it or use it as data.

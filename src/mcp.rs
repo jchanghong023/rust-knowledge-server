@@ -31,8 +31,11 @@ use crate::{
 mod excerpt;
 mod fetch;
 
-use excerpt::{Excerpt, SearchOutput};
-use fetch::{FetchError, SourceRef};
+use excerpt::SearchOutput;
+use fetch::{FetchError, FetchOutput, SourceRef};
+
+const DEFAULT_SEARCH_LIMIT: usize = 5;
+const MAX_SEARCH_LIMIT: usize = 16;
 
 pub(crate) fn router(
     catalog: Arc<Catalog>,
@@ -117,12 +120,20 @@ struct SearchArgs {
     library: Option<String>,
     /// Optional slash-separated relative file or directory path, applied within each selected library.
     path: Option<String>,
+    /// Require a literal match of the complete query; omit for ranked search with related results.
+    #[serde(default)]
+    strict: bool,
+    /// Maximum excerpts on this page, between 1 and 16 (default 5). The 4 KiB text budget still applies.
+    #[schemars(range(min = 1, max = 16))]
+    limit: Option<usize>,
+    /// Copy next_cursor from the previous result and keep query, library, path and strict unchanged.
+    cursor: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct FetchArgs {
-    /// Opaque reference from a knowledge_search match. Copy it verbatim.
+    /// Opaque ref from a search hit or a previous fetch page. Copy it verbatim.
     #[serde(rename = "ref")]
     source_ref: String,
 }
@@ -138,7 +149,7 @@ struct KnowledgeServer {
 #[tool_router]
 impl KnowledgeServer {
     #[tool(
-        description = "Search published enterprise knowledge and code wikis. Returns original excerpts and source locations. Pass a hit's ref to knowledge_fetch for more context. Related hits are not verified facts.",
+        description = "Search published knowledge. Pass query and optionally library, path, or strict. Set limit to 1–16 (default 5); if next_cursor is returned, pass it as cursor with the same query, library, path and strict. match_ranges lists verified source lines and is empty when none were verified. section_title is the original Markdown section. A shared_prefix source has its own wording. Pass ref to knowledge_fetch to read the source.",
         output_schema = rmcp::handler::server::tool::schema_for_output::<SearchOutput<'static>>(),
         annotations(read_only_hint = true, destructive_hint = false)
     )]
@@ -148,25 +159,47 @@ impl KnowledgeServer {
             query,
             library,
             path,
+            strict,
+            limit,
+            cursor,
         }): Parameters<SearchArgs>,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let limit = limit.unwrap_or(DEFAULT_SEARCH_LIMIT);
+        if !(1..=MAX_SEARCH_LIMIT).contains(&limit) {
+            return Err(invalid_input("limit must be between 1 and 16"));
+        }
         let reply = tokio::select! {
             biased;
             _ = context.ct.cancelled() => {
                 return Ok(CallToolResult::error(vec![ContentBlock::text("Search cancelled.")]));
             }
-            reply = search::search(
+            reply = search::page(
                 &self.catalog,
-                SearchRequest { query, library, path },
+                SearchRequest {
+                    query,
+                    library,
+                    path,
+                    strict,
+                },
                 self.embedding.clone(),
                 self.rerank.as_deref(),
                 self.fusion,
+                cursor.as_deref(),
             ) => reply,
         };
-        match reply
-            .and_then(|reply| SearchOutput::from_reply(&reply).map(|output| structured(output)))
-        {
+        let result = match reply {
+            Ok(page) => tokio::task::spawn_blocking(move || {
+                let (mut output, consumed) = SearchOutput::from_reply(&page.reply, limit)?;
+                output.next_cursor = page.next_cursor(consumed)?;
+                output.add_section_titles(&page);
+                Ok(structured(output))
+            })
+            .await
+            .unwrap_or(Err(SearchError::Store)),
+            Err(error) => Err(error),
+        };
+        match result {
             Ok(result) => result,
             Err(SearchError::Store) => Ok(storage_error()),
             Err(SearchError::InvalidInput(message)) => Err(invalid_input(message)),
@@ -175,8 +208,8 @@ impl KnowledgeServer {
     }
 
     #[tool(
-        description = "Read the original lines surrounding a search match. Pass the match's ref verbatim.",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<Excerpt<'static>>(),
+        description = "Read the original context for a search hit, preserving its displayed excerpt. Pass next_ref or previous_ref back as ref to read the adjacent page.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<FetchOutput<'static>>(),
         annotations(read_only_hint = true, destructive_hint = false)
     )]
     async fn knowledge_fetch(

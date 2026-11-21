@@ -127,7 +127,13 @@
                 <p id="path-help" class="hint">可填目录或文件，使用 / 分隔，如 docs/guide.md。</p>
               </div>
             </div>
-            <button class="primary" type="submit">搜索</button>
+            <div class="row-actions">
+              <button class="primary" type="submit">搜索</button>
+              <label class="search-mode">
+                <input id="search-strict" name="strict" type="checkbox">
+                仅字面匹配
+              </label>
+            </div>
           </fieldset>
         </form>
         <section class="subsection" aria-labelledby="results-title">

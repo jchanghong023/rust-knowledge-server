@@ -19,6 +19,17 @@ use tokio::time::{Duration, timeout};
 use super::*;
 use crate::model_http::ApiConfig;
 
+#[derive(Deserialize)]
+struct Passage {
+    text: String,
+    path: String,
+    line_start: usize,
+    line_end: usize,
+    sha256: String,
+    byte_start: usize,
+    exact: Vec<String>,
+}
+
 async fn build_fixture(
     root: &Path,
     version: Uuid,
@@ -106,7 +117,8 @@ async fn reopens_lossless_markdown_with_scoped_keyword_and_exact_indexes() {
     }
     for (i, point) in points.into_iter().enumerate() {
         assert_eq!(point.id, PointId::from(i as u64 + 1));
-        let passage = Passage::from_payload(point.payload.unwrap()).unwrap();
+        let passage: Passage =
+            serde_json::from_value(Value::Object(point.payload.unwrap().0)).unwrap();
         assert_eq!(passage.path, paths[i / 2]);
         assert_eq!(passage.sha256, sha256);
         if i % 2 == 0 {

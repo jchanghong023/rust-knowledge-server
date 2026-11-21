@@ -747,6 +747,7 @@ byId("search-form").addEventListener("submit", async (event) => {
   const data = { query: byId("search-query").value };
   if (searchLibrary.value) data.library = searchLibrary.value;
   if (byId("search-path").value) data.path = byId("search-path").value;
+  if (byId("search-strict").checked) data.strict = true;
   const fields = byId("search-fields");
   const summary = byId("search-summary");
   const results = byId("search-results");
@@ -757,15 +758,19 @@ byId("search-form").addEventListener("submit", async (event) => {
   try {
     const reply = await request("/api/search", jsonBody(data));
     const { scope, status, matches, retrieval, reranked } = reply;
-    const mode = retrieval === "hybrid" ? "混合检索" : "关键词检索";
+    const mode = retrieval === "literal" ? "仅字面匹配" : retrieval === "hybrid" ? "混合检索" : "关键词检索";
     const path = scope.path ? ` · 路径：${scope.path}` : "";
     const library = scope.library == null ? "全部知识库" : scope.library;
-    summary.textContent = `范围：${library}${path} · ${mode} · ${reranked ? "已精排" : "未精排"}`;
+    const ranking = retrieval === "literal" ? "" : ` · ${reranked ? "已精排" : "未精排"}`;
+    summary.textContent = `范围：${library}${path} · ${mode}${ranking}`;
     summary.hidden = false;
     if (status === "no_published_index") {
       message("search-status", "所选知识库范围内没有已发布的索引。请先导入文档并等待发布。");
     } else if (!matches.length) {
-      message("search-status", "已检索发布版本，但没有匹配结果。可调整关键词或放宽路径限制。");
+      const empty = retrieval === "literal"
+        ? "没有找到完整的字面匹配。可检查原文写法或取消「仅字面匹配」。"
+        : "已检索发布版本，但没有匹配结果。可调整关键词或放宽路径限制。";
+      message("search-status", empty);
     } else {
       for (const match of matches) results.append(evidenceResult(match));
       message("search-status", `找到 ${matches.length} 条原文证据。`, "success");

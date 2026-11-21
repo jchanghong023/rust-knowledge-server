@@ -6,18 +6,96 @@ use caseless::Caseless;
 use unicode_ident::{is_xid_continue, is_xid_start};
 use unicode_script::{Script, UnicodeScript};
 
-/// Recognizes a single literal spelling, optionally surrounded by matching quotes.
-/// Multi-word queries are left to ordinary retrieval; no operator syntax is parsed.
-pub(crate) fn query_name(query: &str) -> Option<String> {
+/// Leading/trailing whitespace and one matching pair of quotes delimit a query.
+pub(crate) fn query_spelling(query: &str) -> &str {
     let trimmed = query.trim_matches(|ch: char| ch.is_whitespace() || ch == '\u{feff}');
-    let spelling = match trimmed.as_bytes() {
-        [quote @ (b'`' | b'\'' | b'"'), .., last] if quote == last => {
+    match trimmed.as_bytes() {
+        [quote @ (b'`' | b'\'' | b'"'), _, .., last] if quote == last => {
             &trimmed[1..trimmed.len() - 1]
         }
         _ => trimmed,
-    };
+    }
+}
+
+#[cfg(test)]
+fn query_name(query: &str) -> Option<String> {
+    let spelling = query_spelling(query);
     (spelling.chars().all(name_character) && literal_spelling(spelling))
         .then(|| canonical(spelling).into_owned())
+}
+
+/// Select a required existing posting for a full match, preferring a numeric
+/// standard identifier to an arbitrary word. The raw text is still authoritative.
+pub(crate) fn posting_anchor(spelling: &str) -> Option<(Cow<'_, str>, Option<Range<usize>>)> {
+    let (standard, _, range) = spellings(spelling, 0..spelling.len())
+        .map(|range| {
+            (
+                standard_number(&spelling[range.clone()]),
+                range.len(),
+                range,
+            )
+        })
+        .max_by_key(|&(standard, len, _)| (standard, len))?;
+    Some((
+        canonical(&spelling[range.clone()]),
+        standard.then_some(range),
+    ))
+}
+
+/// Prefer the terms following a standard number: the leading words usually
+/// name the standards family. If the number trails the query, use the prefix.
+pub(crate) fn standard_topics(spelling: &str, number: Range<usize>) -> impl Iterator<Item = &str> {
+    let suffix = number.end..spelling.len();
+    let topics = if spellings(spelling, suffix.clone()).next().is_some() {
+        suffix
+    } else {
+        0..number.start
+    };
+    let mut previous = None;
+    spellings(spelling, topics).filter_map(move |range| {
+        if previous.replace(range.start) == Some(range.start) {
+            None
+        } else {
+            Some(&spelling[range])
+        }
+    })
+}
+
+fn standard_number(spelling: &str) -> bool {
+    let Some((first, rest)) = spelling.split_once('.') else {
+        return false;
+    };
+    first.len() >= 3
+        && first.bytes().all(|ch| ch.is_ascii_digit())
+        && rest
+            .split('.')
+            .all(|part| !part.is_empty() && part.bytes().all(|ch| ch.is_ascii_digit()))
+}
+
+pub(crate) fn ends_inside_name(spelling: &str, next: Option<char>, after: Option<char>) -> bool {
+    let separator = match next {
+        Some(ch) if !name_character(ch) => return false,
+        Some(ch @ ('.' | ':')) => ch as u8,
+        Some(_) => return true,
+        None => return false,
+    };
+    if !prose_separator(separator, spelling.as_bytes()[spelling.len() - 1], after) {
+        return true;
+    }
+    // The historical tokenizer accepts the first prose period/colon as
+    // well as a full token, but never uses a double colon to end a name.
+    let token = spelling
+        .rsplit(|ch| !name_character(ch))
+        .next()
+        .unwrap_or("");
+    token.match_indices(['.', ':']).any(|(at, stop)| {
+        at > 0
+            && prose_separator(
+                stop.as_bytes()[0],
+                token.as_bytes()[at - 1],
+                token[at + 1..].chars().next().or(next),
+            )
+    })
 }
 
 /// Returns complete names in first-occurrence order, deduplicated by folded spelling.
@@ -36,25 +114,6 @@ pub(crate) fn section_names(document: &str, span: Range<usize>) -> Vec<String> {
         ordered[ordinal] = name.into_owned();
     }
     ordered
-}
-
-pub(crate) fn name_span(text: &str, folded: &str) -> Option<Range<usize>> {
-    let mut at_boundary = None;
-    for span in spellings(text, 0..text.len()) {
-        let spelling = &text[span.clone()];
-        let matches = if spelling.is_ascii() {
-            spelling.eq_ignore_ascii_case(folded)
-        } else {
-            spelling.chars().default_case_fold().eq(folded.chars())
-        };
-        if matches {
-            if span.start != 0 && span.end + 1 < text.len() {
-                return Some(span);
-            }
-            at_boundary.get_or_insert(span);
-        }
-    }
-    at_boundary
 }
 
 fn spellings(document: &str, span: Range<usize>) -> impl Iterator<Item = Range<usize>> + '_ {
@@ -126,7 +185,7 @@ fn identifier_continue(ch: char) -> bool {
     }
 }
 
-fn name_character(ch: char) -> bool {
+pub(crate) fn name_character(ch: char) -> bool {
     matches!(ch, '+' | '#' | '/' | '\\' | '.' | ':' | '-')
         || (identifier_continue(ch) && !is_han(ch))
 }
@@ -175,16 +234,20 @@ fn prose_end(document: &str, start: usize, end: usize) -> Option<usize> {
     candidate
         .match_indices(['.', ':'])
         .find_map(|(offset, stop)| {
-            if offset == 0 || (stop == ":" && candidate.as_bytes()[offset - 1] == b':') {
-                return None;
-            }
             let following = start + offset + 1;
-            (!document[following..]
-                .chars()
-                .next()
-                .is_some_and(|ch| ch == ':' || identifier_continue(ch)))
+            (offset > 0
+                && prose_separator(
+                    stop.as_bytes()[0],
+                    candidate.as_bytes()[offset - 1],
+                    document[following..].chars().next(),
+                ))
             .then_some(start + offset)
         })
+}
+
+fn prose_separator(separator: u8, preceding: u8, following: Option<char>) -> bool {
+    !(separator == b':' && preceding == b':')
+        && !following.is_some_and(|ch| ch == ':' || identifier_continue(ch))
 }
 
 #[cfg(test)]

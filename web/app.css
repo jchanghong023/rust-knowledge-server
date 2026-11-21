@@ -162,6 +162,8 @@ label { display: block; margin-bottom: .35rem; font-size: .875rem; font-weight: 
 .control-row { display: flex; align-items: stretch; gap: .5rem; }
 .control-row button { flex: none; }
 .search-filters { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr); gap: .85rem; }
+.search-mode { display: inline-flex; align-items: center; gap: .4rem; min-height: 2.625rem; margin: 0; padding-inline: .3rem; }
+.search-mode input { width: 1rem; min-height: 1rem; padding: 0; accent-color: var(--primary); }
 button, input, select {
   min-height: 2.625rem;
   border: 1px solid var(--control);

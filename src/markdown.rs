@@ -1,5 +1,7 @@
 //! Source spans and UTF-16 chunking adapted from OMP's `crates/knowledge/src/import.rs` (MIT).
 
+use std::ops::Range;
+
 use pulldown_cmark::{CodeBlockKind, Event, Parser, Tag};
 
 const MAX_SECTION_UNITS: usize = 18_000;
@@ -15,7 +17,7 @@ pub(crate) struct Section<'a> {
 
 /// Returns ordered, lossless source slices. Only windows of an oversized line overlap.
 pub(crate) fn sections(source: &str) -> Vec<Section<'_>> {
-    let mut headings = heading_offsets(source).peekable();
+    let mut headings = heading_spans(source).map(|span| span.start).peekable();
 
     let mut at = Position { byte: 0, line: 1 };
     let mut chunks = Chunks {
@@ -42,7 +44,55 @@ pub(crate) fn sections(source: &str) -> Vec<Section<'_>> {
     chunks.sections
 }
 
-fn heading_offsets(source: &str) -> impl Iterator<Item = usize> + '_ {
+#[derive(PartialEq, Eq)]
+pub(crate) enum HeadingBoundary {
+    Proven,
+    NeedsEndOfFile,
+    MayBeSizeSplit,
+}
+
+/// A local witness that a non-overlapping passage starts at a real heading.
+/// If an ordinary predecessor and the first line fit together, the immediate
+/// size limit could not have made the cut. A cut after a blank could also have
+/// been a later overflow spilling to that blank, unless the next blank fit
+/// or there was no more input to overflow.
+pub(crate) fn heading_boundary(previous: &str, current: &str) -> HeadingBoundary {
+    use HeadingBoundary::{MayBeSizeSplit, NeedsEndOfFile, Proven};
+    let units = |text: &str| {
+        if text.is_ascii() {
+            text.len()
+        } else {
+            text.encode_utf16().count()
+        }
+    };
+    let mut current_lines = source_lines(current);
+    let Some(first) = current_lines.next() else {
+        return MayBeSizeSplit;
+    };
+    let Some(remaining) = MAX_SECTION_UNITS.checked_sub(units(previous) + units(first)) else {
+        return MayBeSizeSplit;
+    };
+    if !source_lines(previous)
+        .last()
+        .is_some_and(|line| line.chars().all(is_blank_char))
+    {
+        return Proven;
+    }
+    let mut remaining = remaining;
+    for line in current_lines {
+        let Some(after) = remaining.checked_sub(units(line)) else {
+            return MayBeSizeSplit;
+        };
+        if line.chars().all(is_blank_char) {
+            return Proven;
+        }
+        remaining = after;
+    }
+    NeedsEndOfFile
+}
+
+/// Top-level native Markdown headings, excluding nested blocks and fences.
+pub(crate) fn heading_spans(source: &str) -> impl Iterator<Item = Range<usize>> + '_ {
     let markdown = source.strip_prefix('\u{feff}').unwrap_or(source);
     let mut base = source.len() - markdown.len();
     let mut events = Parser::new(markdown).into_offset_iter();
@@ -52,7 +102,7 @@ fn heading_offsets(source: &str) -> impl Iterator<Item = usize> + '_ {
             match event {
                 Event::Start(Tag::Heading { .. }) if depth == 0 => {
                     depth += 1;
-                    return Some(base + span.start);
+                    return Some(base + span.start..base + span.end);
                 }
                 Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(_))) if depth == 0 => {
                     let start = base + span.start;

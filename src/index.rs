@@ -63,23 +63,6 @@ pub(crate) fn bm25() -> io::Result<&'static EdgeBm25> {
         .map_err(|error| io::Error::other(error.clone()))
 }
 
-#[derive(Serialize, Deserialize)]
-pub(crate) struct Passage {
-    pub(crate) text: String,
-    pub(crate) path: String,
-    pub(crate) line_start: usize,
-    pub(crate) line_end: usize,
-    pub(crate) sha256: String,
-    pub(crate) byte_start: usize,
-    pub(crate) exact: Vec<String>,
-}
-
-impl Passage {
-    pub(crate) fn from_payload(payload: Payload) -> serde_json::Result<Self> {
-        serde_json::from_value(Value::Object(payload.0))
-    }
-}
-
 #[derive(Debug)]
 pub(crate) enum IndexError {
     Document(ImportError),

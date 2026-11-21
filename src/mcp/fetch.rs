@@ -1,7 +1,8 @@
 use std::{ops::Range, sync::Arc};
 
 use qdrant_edge::{EdgeShard, JsonPath, PointId, RetrieveRequest, WithPayloadInterface};
-use serde::Deserialize;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -11,9 +12,7 @@ use crate::{
     search::Source,
 };
 
-use super::excerpt::{BYTE_LIMIT, Excerpt, boundary, lines_for, window};
-
-const LINE_LIMIT: usize = 60;
+use super::excerpt::{BYTE_LIMIT, Excerpt, LINE_LIMIT, boundary, limit_lines, lines_for, window};
 
 #[derive(Debug)]
 pub(super) enum FetchError {
@@ -26,18 +25,37 @@ pub(super) struct SourceRef {
     library: Uuid,
     version: Uuid,
     point: u64,
-    absolute: Range<usize>,
+    target: Target,
+}
+
+enum Target {
+    Evidence(Range<usize>),
+    Next(usize),
+    Previous(usize),
 }
 
 impl SourceRef {
-    pub(super) fn encode(source: &Source, anchor: &Range<usize>) -> String {
-        format!(
-            "v1.{}.{}.{}.{}.{}",
-            source.library.simple(),
-            source.version.simple(),
+    pub(super) fn encode(source: &Source, range: &Range<usize>) -> String {
+        Self::encode_target(
+            source.library,
+            source.version,
             source.point,
-            source.byte_start + anchor.start,
-            anchor.len()
+            source.byte_start + range.start,
+            range.len(),
+        )
+    }
+
+    fn encode_target(
+        library: Uuid,
+        version: Uuid,
+        point: u64,
+        start: usize,
+        mode: impl std::fmt::Display,
+    ) -> String {
+        format!(
+            "v1.{}.{}.{point}.{start}.{mode}",
+            library.simple(),
+            version.simple()
         )
     }
 
@@ -50,12 +68,23 @@ impl SourceRef {
         let version = Uuid::try_parse(fields.next()?).ok()?;
         let point: u64 = fields.next()?.parse().ok()?;
         let start: usize = fields.next()?.parse().ok()?;
-        let len: usize = fields.next()?.parse().ok()?;
-        (point != 0 && (1..=BYTE_LIMIT).contains(&len) && fields.next().is_none()).then_some(Self {
+        // Numeric lengths also accept previously issued short-anchor references.
+        let target = match fields.next()? {
+            "n" => Target::Next(start),
+            "p" => Target::Previous(start),
+            len => {
+                let len: usize = len.parse().ok()?;
+                if !(1..=BYTE_LIMIT).contains(&len) {
+                    return None;
+                }
+                Target::Evidence(start..start.checked_add(len)?)
+            }
+        };
+        (point != 0 && fields.next().is_none()).then_some(Self {
             library,
             version,
             point,
-            absolute: start..start.checked_add(len)?,
+            target,
         })
     }
 
@@ -75,17 +104,31 @@ pub(super) struct Fetched {
     line_start: usize,
     line_end: usize,
     truncated: bool,
+    next_ref: Option<String>,
+    previous_ref: Option<String>,
+}
+
+#[derive(JsonSchema, Serialize)]
+pub(super) struct FetchOutput<'a> {
+    #[serde(flatten)]
+    excerpt: Excerpt<'a>,
+    next_ref: Option<&'a str>,
+    previous_ref: Option<&'a str>,
 }
 
 impl Fetched {
-    pub(super) fn excerpt(&self) -> Excerpt<'_> {
-        Excerpt {
-            text: &self.source[self.range.clone()],
-            library: self.version.library(),
-            path: &self.path,
-            line_start: self.line_start,
-            line_end: self.line_end,
-            truncated: self.truncated,
+    pub(super) fn excerpt(&self) -> FetchOutput<'_> {
+        FetchOutput {
+            excerpt: Excerpt {
+                text: &self.source[self.range.clone()],
+                library: self.version.library(),
+                path: &self.path,
+                line_start: self.line_start,
+                line_end: self.line_end,
+                truncated: self.truncated,
+            },
+            next_ref: self.next_ref.as_deref(),
+            previous_ref: self.previous_ref.as_deref(),
         }
     }
 }
@@ -95,60 +138,148 @@ pub(super) fn read(version: Arc<Version>, locator: SourceRef) -> Result<Fetched,
     let center = reader
         .passage(locator.point)?
         .ok_or(FetchError::InvalidRef)?;
-    let start = locator
-        .absolute
-        .start
-        .checked_sub(center.byte_start)
-        .ok_or(FetchError::InvalidRef)?;
-    let anchor = start..start + locator.absolute.len();
-    let anchor_text = center
-        .text
-        .get(anchor.clone())
-        .ok_or(FetchError::InvalidRef)?;
-    // A reference points at a name or a single character, never across physical lines.
-    if !boundary(&center.text, anchor.start)
-        || !boundary(&center.text, anchor.end)
-        || source_lines(anchor_text).count() != 1
-    {
-        return Err(FetchError::InvalidRef);
-    }
-
-    let (before, from, prior_bytes) = preceding(&reader, locator.point, &center, anchor.start)?;
+    let anchor = locator.target.in_passage(&center)?;
+    let next_page = matches!(locator.target, Target::Next(_));
+    let previous_page = matches!(locator.target, Target::Previous(_));
+    let (before, from, prior_bytes) = if next_page {
+        (Pieces::new(), anchor.start, 0)
+    } else {
+        preceding(&reader, locator.point, &center, anchor.start)?
+    };
     let (first, earliest) = before
         .last()
-        .map_or((&center, from), |(passage, range)| (passage, range.start));
-    let first_line = if earliest == 0 {
-        first.line_start
+        .map_or((&center, from), |(_, passage, range)| {
+            (passage, range.start)
+        });
+    let first_line = first.line_at(earliest);
+    let context_start = first.byte_start + earliest;
+    let after_bytes = if previous_page {
+        0
     } else {
-        lines_for(&first.text, &(earliest..earliest + 1), first.line_start).0
+        center.text.len() - anchor.end
     };
-    let left_truncated = first.byte_start + earliest != 0;
-    let mut context = String::with_capacity(
-        prior_bytes + anchor.len() + (center.text.len() - anchor.end).min(BYTE_LIMIT),
-    );
-    for (passage, range) in before.iter().rev() {
-        context.push_str(&passage.text[range.clone()]);
+    let mut context = Context::new(prior_bytes + anchor.len() + after_bytes.min(BYTE_LIMIT));
+    for (id, passage, range) in before.iter().rev() {
+        context.push(*id, &passage.text[range.clone()]);
     }
-    context.push_str(&center.text[from..anchor.end]);
-    let right_truncated =
-        append_following(&mut context, &reader, locator.point, &center, anchor.end)?;
-    let anchor = prior_bytes..prior_bytes + anchor.len();
-    let mut range = window(&context, &anchor, BYTE_LIMIT);
-    limit_lines(&context, &anchor, &mut range);
-    let (line_start, line_end) = lines_for(&context, &range, first_line);
-    let truncated = left_truncated || right_truncated || range.len() < context.len();
+    context.push(locator.point, &center.text[from..anchor.end]);
+    let right_truncated = previous_page
+        || append_following(&mut context, &reader, locator.point, &center, anchor.end)?;
+    let range = if next_page {
+        0..source_lines(&context.text)
+            .take(LINE_LIMIT)
+            .map(str::len)
+            .sum()
+    } else if previous_page {
+        let skip = source_lines(&context.text)
+            .count()
+            .saturating_sub(LINE_LIMIT);
+        source_lines(&context.text).take(skip).map(str::len).sum()..context.text.len()
+    } else {
+        let anchor = prior_bytes..prior_bytes + anchor.len();
+        let mut range = window(&context.text, &anchor, BYTE_LIMIT);
+        limit_lines(&context.text, &anchor, &mut range);
+        range
+    };
+    if range.is_empty() {
+        return Err(FetchError::InvalidRef);
+    }
+    let (line_start, line_end) = lines_for(&context.text, &range, first_line);
+    // Point cursors at an included byte next to the edge. At a passage seam,
+    // the adjacent page can then advance using the same overlap checks as context.
+    let reference = |near, offset, mode| {
+        SourceRef::encode_target(
+            locator.library,
+            locator.version,
+            context.point_at(near),
+            context_start + offset,
+            mode,
+        )
+    };
+    let next_ref = (right_truncated || range.end < context.text.len())
+        .then(|| reference(range.end - 1, range.end, 'n'));
+    let previous_ref =
+        (context_start + range.start > 0).then(|| reference(range.start, range.start, 'p'));
+    let truncated = next_ref.is_some() || previous_ref.is_some();
     Ok(Fetched {
         version,
         path: center.path,
-        source: context,
+        source: context.text,
         range,
         line_start,
         line_end,
         truncated,
+        next_ref,
+        previous_ref,
     })
 }
 
-type Pieces = Vec<(TextPassage, Range<usize>)>;
+impl Target {
+    fn in_passage(&self, passage: &TextPassage) -> Result<Range<usize>, FetchError> {
+        let local = |at: usize| at.checked_sub(passage.byte_start);
+        let range = match self {
+            Self::Evidence(absolute) => {
+                let start = local(absolute.start).ok_or(FetchError::InvalidRef)?;
+                let end = local(absolute.end).ok_or(FetchError::InvalidRef)?;
+                let text = passage.text.get(start..end).ok_or(FetchError::InvalidRef)?;
+                if source_lines(text).nth(LINE_LIMIT).is_some() {
+                    return Err(FetchError::InvalidRef);
+                }
+                start..end
+            }
+            Self::Next(at) => {
+                let at = local(*at)
+                    .filter(|&at| at > 0)
+                    .ok_or(FetchError::InvalidRef)?;
+                at..at
+            }
+            Self::Previous(at) => {
+                let at = local(*at)
+                    .filter(|&at| at < passage.text.len())
+                    .ok_or(FetchError::InvalidRef)?;
+                at..at
+            }
+        };
+        if !boundary(&passage.text, range.start) || !boundary(&passage.text, range.end) {
+            return Err(FetchError::InvalidRef);
+        }
+        Ok(range)
+    }
+}
+
+struct Context {
+    text: String,
+    // Offsets where source bytes begin contributing from a different point.
+    points: Vec<(usize, u64)>,
+}
+
+impl Context {
+    fn new(capacity: usize) -> Self {
+        Self {
+            text: String::with_capacity(capacity),
+            points: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, point: u64, text: &str) {
+        if !text.is_empty() {
+            if self
+                .points
+                .last()
+                .is_none_or(|&(_, previous)| previous != point)
+            {
+                self.points.push((self.text.len(), point));
+            }
+            self.text.push_str(text);
+        }
+    }
+
+    fn point_at(&self, offset: usize) -> u64 {
+        self.points[self.points.partition_point(|&(start, _)| start <= offset) - 1].1
+    }
+}
+
+type Pieces = Vec<(u64, TextPassage, Range<usize>)>;
 
 // Collect only the suffixes that can contribute to the bounded response.
 fn preceding(
@@ -162,7 +293,7 @@ fn preceding(
     let mut pieces = Pieces::new();
     if from == 0 {
         loop {
-            let current = pieces.last().map_or(center, |(passage, _)| passage);
+            let current = pieces.last().map_or(center, |(_, passage, _)| passage);
             if used >= BYTE_LIMIT || current.byte_start == 0 {
                 break;
             }
@@ -176,7 +307,7 @@ fn preceding(
             let start = suffix_start(&previous.text, end, BYTE_LIMIT - used);
             used += end - start;
             if start < end {
-                pieces.push((previous, start..end));
+                pieces.push((id, previous, start..end));
             }
             if start != 0 {
                 break;
@@ -195,7 +326,7 @@ fn suffix_start(text: &str, end: usize, budget: usize) -> usize {
 }
 
 fn append_following(
-    context: &mut String,
+    context: &mut Context,
     reader: &Reader<'_>,
     mut id: u64,
     center: &TextPassage,
@@ -209,9 +340,9 @@ fn append_following(
         while !boundary(&passage.text, end) {
             end -= 1;
         }
-        context.push_str(&passage.text[start..end]);
+        context.push(id, &passage.text[start..end]);
         remaining -= end - start;
-        if end != passage.text.len() || remaining == 0 {
+        if end != passage.text.len() {
             return Ok(true);
         }
         let Some(next_id) = id.checked_add(1) else {
@@ -224,35 +355,21 @@ fn append_following(
             return Ok(false);
         }
         start = passage.overlap(&next)?;
+        if remaining == 0 {
+            return Ok(true);
+        }
         id = next_id;
         current = Some(next);
     }
 }
 
-fn limit_lines(source: &str, anchor: &Range<usize>, range: &mut Range<usize>) {
-    let text = &source[range.clone()];
-    let count = source_lines(text).count();
-    if count <= LINE_LIMIT {
-        return;
-    }
-    let offset = range.start;
-    let anchor = anchor.start - offset..anchor.end - offset;
-    let (line, _) = lines_for(text, &anchor, 1);
-    let skip = (line - 1)
-        .saturating_sub(LINE_LIMIT / 3)
-        .min(count - LINE_LIMIT);
-    let mut lines = source_lines(text);
-    range.start += lines.by_ref().take(skip).map(str::len).sum::<usize>();
-    range.end = range.start + lines.take(LINE_LIMIT).map(str::len).sum::<usize>();
-}
-
-struct Reader<'a> {
+pub(super) struct Reader<'a> {
     shard: &'a EdgeShard,
     fields: WithPayloadInterface,
 }
 
 impl<'a> Reader<'a> {
-    fn new(shard: &'a EdgeShard) -> Self {
+    pub(super) fn new(shard: &'a EdgeShard) -> Self {
         let fields = ["text", "path", "line_start", "line_end", "byte_start"];
         Self {
             shard,
@@ -265,7 +382,7 @@ impl<'a> Reader<'a> {
         }
     }
 
-    fn passage(&self, id: u64) -> Result<Option<TextPassage>, FetchError> {
+    pub(super) fn passage(&self, id: u64) -> Result<Option<TextPassage>, FetchError> {
         let id = PointId::NumId(id);
         let mut request = RetrieveRequest::new(vec![id]);
         request.with_payload = Some(self.fields.clone());
@@ -294,21 +411,48 @@ impl<'a> Reader<'a> {
 }
 
 #[derive(Deserialize)]
-struct TextPassage {
-    text: String,
-    path: String,
-    byte_start: usize,
-    line_start: usize,
+pub(super) struct TextPassage {
+    pub(super) text: String,
+    pub(super) path: String,
+    pub(super) byte_start: usize,
+    pub(super) line_start: usize,
     line_end: usize,
 }
 
 impl TextPassage {
+    pub(super) fn spans_multiple_lines(&self) -> bool {
+        self.line_start < self.line_end
+    }
+
+    fn line_at(&self, at: usize) -> usize {
+        if at == 0 {
+            self.line_start
+        } else if at == self.text.len() {
+            self.line_end + usize::from(self.text.ends_with(['\r', '\n']))
+        } else if self.line_start == self.line_end {
+            self.line_start
+        } else {
+            lines_for(&self.text, &(at..at + 1), self.line_start).0
+        }
+    }
+
     fn overlap(&self, next: &Self) -> Result<usize, FetchError> {
-        let advance = next
-            .byte_start
+        let prefix =
+            self.prefix_before(&next.path, &next.text, next.byte_start, next.line_start)?;
+        Ok(self.text.len() - prefix.len())
+    }
+
+    pub(super) fn prefix_before(
+        &self,
+        path: &str,
+        text: &str,
+        byte_start: usize,
+        line_start: usize,
+    ) -> Result<&str, FetchError> {
+        let advance = byte_start
             .checked_sub(self.byte_start)
             .ok_or(FetchError::Store)?;
-        if self.path != next.path || advance == 0 {
+        if self.path != path || advance == 0 {
             return Err(FetchError::Store);
         }
         let tail = self.text.get(advance..).ok_or(FetchError::Store)?;
@@ -317,13 +461,13 @@ impl TextPassage {
         } else {
             self.line_end
         };
-        if tail.len() >= next.text.len()
-            || !next.text.starts_with(tail)
-            || expected_line != next.line_start
+        if tail.len() >= text.len()
+            || !text.starts_with(tail)
+            || expected_line != line_start
             || (tail.is_empty() && !self.text.ends_with(['\r', '\n']))
         {
             return Err(FetchError::Store);
         }
-        Ok(tail.len())
+        Ok(&self.text[..advance])
     }
 }

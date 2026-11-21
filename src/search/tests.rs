@@ -83,6 +83,7 @@ fn request(query: &str, library: Option<&str>, path: Option<&str>) -> SearchRequ
         query: query.into(),
         library: library.map(str::to_owned),
         path: path.map(str::to_owned),
+        strict: false,
     }
 }
 
@@ -221,6 +222,424 @@ async fn real_index_preserves_technical_evidence_and_distinguishes_empty_states(
 }
 
 #[tokio::test]
+async fn literal_priority_checks_complete_compounds_and_preserves_raw_anchors() {
+    let fixture = Fixture::new();
+    fixture
+        .publish(
+            "docs",
+            &[
+                ("a-related.md", "March C+ uses -xprop=tmerge2 with STRASSE2"),
+                ("b-related.md", "xMarch C- uses --xprop=tmerge instead"),
+                ("c-related.md", "March C-- uses -xprop=tmerge.log"),
+                (
+                    "z-literal.md",
+                    "中文(-Xprop=Tmerge), March C- and Straße.\r\n",
+                ),
+            ],
+            None,
+        )
+        .await;
+
+    for (query, raw) in [
+        ("`-xprop=tmerge`", "-Xprop=Tmerge"),
+        ("mArCh C-", "March C-"),
+        ("STRASSE", "Straße"),
+    ] {
+        for strict in [false, true] {
+            let reply = search(
+                &fixture.catalog,
+                SearchRequest {
+                    strict,
+                    ..request(query, Some("docs"), None)
+                },
+                None,
+                None,
+                FusionMode::Grouped,
+            )
+            .await
+            .unwrap();
+            assert_eq!(reply.matches[0].path, "z-literal.md", "{query}");
+            let exact: Vec<_> = reply
+                .matches
+                .iter()
+                .filter(|hit| hit.category == Category::Exact)
+                .collect();
+            assert_eq!(exact.len(), 1, "{query}");
+            assert_eq!((exact[0].line_start, exact[0].line_end), (1, 1));
+            assert_eq!(&exact[0].text[exact[0].anchor.clone().unwrap()], raw);
+            if strict {
+                assert_eq!(reply.retrieval, Retrieval::Literal);
+                assert_eq!(reply.matches.len(), 1);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn both_modes_scan_unindexed_literals_and_check_real_passage_edges() {
+    let fixture = Fixture::new();
+    // The first two files put a misleading `123` at a window's artificial
+    // end or start. The cut at 17,500 starts the overlapping second window.
+    let right_cut = format!("{}1234 {}", " ".repeat(17_997), "x".repeat(520));
+    let left_cut = format!("{}9123 {}", " ".repeat(17_499), "x".repeat(520));
+    fixture
+        .publish(
+            "docs",
+            &[
+                ("guide/right.md", &right_cut),
+                ("guide/left.md", &left_cut),
+                ("guide/exact.md", "用边界扫描确认文本 123 确实存在\r\n"),
+                ("outside.md", "用边界扫描确认文本 123 确实存在"),
+            ],
+            None,
+        )
+        .await;
+    for (query, raw) in [("123", "123"), ("边界扫描", "边界扫描"), ("'\r\n'", "\r\n")] {
+        for strict in [false, true] {
+            let reply = search(
+                &fixture.catalog,
+                SearchRequest {
+                    strict,
+                    ..request(query, None, Some("guide"))
+                },
+                None,
+                None,
+                FusionMode::Edge,
+            )
+            .await
+            .unwrap();
+            let exact = reply
+                .matches
+                .iter()
+                .filter(|item| item.category == Category::Exact)
+                .collect::<Vec<_>>();
+            assert_eq!(exact.len(), 1, "{query}");
+            assert_eq!(exact[0].path, "guide/exact.md");
+            assert_eq!(&exact[0].text[exact[0].anchor.clone().unwrap()], raw);
+        }
+    }
+    for query in ["'\r'", "'\n'"] {
+        let reply = search(
+            &fixture.catalog,
+            SearchRequest {
+                strict: true,
+                ..request(query, None, Some("guide"))
+            },
+            None,
+            None,
+            FusionMode::Grouped,
+        )
+        .await
+        .unwrap();
+        assert!(reply.matches.is_empty(), "{query:?}");
+    }
+}
+
+#[tokio::test]
+async fn pages_reach_diversity_and_result_limit_overflow_in_both_modes() {
+    let fixture = Fixture::new();
+    let repeated = (0..40)
+        .map(|i| format!("# Quartz Needle {i}\n\nContext for heading {i}.\n\n"))
+        .collect::<String>();
+    fixture
+        .publish(
+            "docs",
+            &[
+                ("a.md", &repeated),
+                ("b.md", "# Quartz Needle\n\nOther context."),
+                ("c.md", "Needle and quartz appear separately."),
+            ],
+            None,
+        )
+        .await;
+
+    let mut strict_exact = Vec::new();
+    for strict in [true, false] {
+        let mut cursor = None;
+        let mut exact = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut saw_related = false;
+        for iteration in 0..16 {
+            let batch = page(
+                &fixture.catalog,
+                SearchRequest {
+                    strict,
+                    ..request("Quartz Needle", Some("docs"), None)
+                },
+                None,
+                None,
+                FusionMode::Grouped,
+                cursor.as_deref(),
+            )
+            .await
+            .unwrap();
+            if iteration == 0 {
+                assert_eq!(&paths(&batch.reply)[..3], ["a.md", "a.md", "b.md"]);
+                assert!(batch.version(&batch.reply.matches[0].source).is_some());
+            }
+            let consumed = batch.reply.matches.len().min(5);
+            for hit in &batch.reply.matches[..consumed] {
+                assert!(seen.insert(hit.source.point));
+                if hit.category == Category::Exact {
+                    assert!(!saw_related, "exact evidence must precede related");
+                    exact.push(hit.source.point);
+                } else {
+                    saw_related = true;
+                }
+            }
+            cursor = batch.next_cursor(consumed).unwrap();
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert!(cursor.is_none(), "pagination never exhausted");
+        assert_eq!(exact.len(), 41);
+        if strict {
+            strict_exact = exact;
+        } else {
+            assert_eq!(exact, strict_exact);
+        }
+    }
+}
+
+#[tokio::test]
+async fn pages_keep_original_ranking_and_reject_changed_publication() {
+    let fixture = Fixture::new();
+    let server = Loopback::start().await;
+    let rerank = Rerank::new(server.config("rerank")).unwrap();
+    let names = (0..BRANCH_LIMIT)
+        .map(|i| format!("{i:02}.md"))
+        .collect::<Vec<_>>();
+    let docs = names
+        .iter()
+        .map(|name| (name.as_str(), "C++17 amber"))
+        .collect::<Vec<_>>();
+    fixture.publish("docs", &docs, None).await;
+    fixture.catalog.create("other", None).unwrap();
+    fixture.publish("other", &docs, None).await;
+    let get = |cursor| {
+        page(
+            &fixture.catalog,
+            request("C++", None, None),
+            None,
+            Some(&rerank),
+            FusionMode::Grouped,
+            cursor,
+        )
+    };
+    let first = get(None).await.unwrap();
+    assert!(first.reply.reranked);
+    assert_eq!(first.reply.matches.len(), 2 * RESULT_LIMIT);
+    let cursor = first.next_cursor(3).unwrap().unwrap();
+    let second = get(Some(&cursor)).await.unwrap();
+    assert_eq!(
+        &second.reply.matches[..first.reply.matches.len() - 3],
+        &first.reply.matches[3..],
+    );
+    let tail_cursor = first.next_cursor(RESULT_LIMIT + 3).unwrap().unwrap();
+    let tail = get(Some(&tail_cursor)).await.unwrap();
+    assert_eq!(tail.reply.matches, first.reply.matches[RESULT_LIMIT + 3..]);
+    assert_eq!(tail.next_cursor(tail.reply.matches.len()).unwrap(), None);
+    server.state.rerank_mode.store(3, Relaxed);
+    assert_eq!(
+        get(Some(&cursor)).await.unwrap().reply.matches,
+        second.reply.matches
+    );
+    fixture.publish("docs", &[("new.md", "C++")], None).await;
+    assert!(matches!(get(Some(&cursor)).await, Err(page::STALE_CURSOR)));
+    // The already returned page can still look up metadata in the old version.
+    assert!(
+        first
+            .version(&first.reply.matches[0].source)
+            .unwrap()
+            .open()
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn postings_recover_a_literal_past_the_keyword_window_and_boost_a_standard() {
+    let fixture = Fixture::new();
+    let noise = (0..BRANCH_LIMIT + LITERAL_BATCH)
+        .map(|i| format!("noise/{i:02}.md"))
+        .collect::<Vec<_>>();
+    let answer = format!(
+        "{}Quartz cobalt 1149.1",
+        "plain intervening context ".repeat(100),
+    );
+    let competing = format!("1149.10 cobalt cobalt {} quartz quartz", "x".repeat(128));
+    let docs = noise
+        .iter()
+        .map(|name| (name.as_str(), competing.as_str()))
+        .chain([
+            ("z-identifier.md", "The standard is IEEE 1149.1."),
+            ("zz-literal.md", answer.as_str()),
+        ])
+        .collect::<Vec<_>>();
+    fixture.publish("docs", &docs, None).await;
+    for query in ["quartz cobalt", "quartz cobalt 1149.1"] {
+        let reply = search(
+            &fixture.catalog,
+            request(query, Some("docs"), None),
+            None,
+            None,
+            FusionMode::Grouped,
+        )
+        .await
+        .unwrap();
+        let exact = &reply.matches[0];
+        assert_eq!(exact.path, "zz-literal.md");
+        assert_eq!(exact.category, Category::Exact);
+        if query.ends_with("1149.1") {
+            let standard = &reply.matches[1];
+            assert_eq!(standard.path, "z-identifier.md");
+            assert_eq!(standard.category, Category::Related);
+            assert_eq!(&standard.text[standard.anchor.clone().unwrap()], "1149.1");
+        }
+    }
+}
+
+#[tokio::test]
+async fn exact_compounds_keep_strict_source_choices_in_ranked_modes() {
+    let fixture = Fixture::new();
+    let server = Loopback::start().await;
+    let rerank = Rerank::new(server.config("rerank")).unwrap();
+    for (query, decoy) in [
+        ("Quill Z-", "Quill Z+"),
+        ("-simstyle=plume", "-simstyle=plumes"),
+    ] {
+        let context = "Synthetic fixture introduction. ".repeat(40);
+        let strong_lexical = format!("{query} ").repeat(10);
+        let manual = format!(
+            "# First\n\n{query} introduction.\n{context}\n\n\
+             ## Second\n\n{query} procedure.\n{context}\n\n\
+             ## Third\n\n{strong_lexical}\n"
+        );
+        let standalone = format!("Use `{query}` in the alternative procedure.");
+        fixture
+            .publish(
+                "docs",
+                &[
+                    ("a-manual.md", &manual),
+                    ("b-example.md", &standalone),
+                    ("c-decoy.md", decoy),
+                ],
+                None,
+            )
+            .await;
+        let strict = search(
+            &fixture.catalog,
+            SearchRequest {
+                strict: true,
+                ..request(query, Some("docs"), None)
+            },
+            None,
+            None,
+            FusionMode::Grouped,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            paths(&strict),
+            ["a-manual.md", "a-manual.md", "b-example.md"]
+        );
+        assert!(strict.matches[0].text.contains("introduction."));
+        assert!(strict.matches[1].text.contains("procedure."));
+        for model in [None, Some(&rerank)] {
+            let reply = search(
+                &fixture.catalog,
+                request(query, Some("docs"), None),
+                None,
+                model,
+                FusionMode::Grouped,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                &reply.matches[..strict.matches.len()],
+                strict.matches.as_slice(),
+                "{query}"
+            );
+            assert_eq!(reply.reranked, model.is_some(), "{query}");
+            assert!(
+                reply.matches[strict.matches.len()..]
+                    .iter()
+                    .all(|answer| answer.category == Category::Related)
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn standard_priority_requires_nearby_complete_topic_evidence() {
+    let fixture = Fixture::new();
+    let server = Loopback::start().await;
+    let rerank = Rerank::new(server.config("rerank")).unwrap();
+    let cross_reference = format!(
+        "# NOVA 852.4\n\nCompare NOVA 701.3 for calibration. {}\
+         The LATCH input is optional in this fixture.",
+        "Calibration notes for the synthetic circuit. ".repeat(20)
+    );
+    fixture
+        .publish(
+            "docs",
+            &[
+                ("a-incidental.md", &cross_reference),
+                (
+                    "a-near-reference.md",
+                    "NOVA 852.4, see NOVA 701.3 for comparison. LATCH optional: bench example.",
+                ),
+                ("b-identifier.md", "See NOVA 701.3 for calibration."),
+                (
+                    "c-topic.md",
+                    "The LATCH input is optional in the bench example.",
+                ),
+                (
+                    "d-partial.md",
+                    "NOVA 701.3 has a LATCH2 input. It is optional.",
+                ),
+                (
+                    "y-target.md",
+                    "Under NOVA 701.3, the LATCH input is optional. Leave the pin open.",
+                ),
+                ("z-literal.md", "Checklist: NOVA 701.3 LATCH optional."),
+            ],
+            None,
+        )
+        .await;
+    for model in [None, Some(&rerank)] {
+        let reply = search(
+            &fixture.catalog,
+            request("NOVA 701.3 LATCH optional", Some("docs"), None),
+            None,
+            model,
+            FusionMode::Grouped,
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply.reranked, model.is_some());
+        assert_eq!(&paths(&reply)[..2], ["z-literal.md", "y-target.md"]);
+        assert_eq!(reply.matches[0].category, Category::Exact);
+        let target = &reply.matches[1];
+        assert_eq!(target.category, Category::Related);
+        let anchored = &target.text[target.anchor.clone().unwrap()];
+        assert!(anchored.contains("LATCH input is optional"), "{anchored}");
+        assert!(anchored.contains("701.3"), "{anchored}");
+        let position = |path| {
+            reply
+                .matches
+                .iter()
+                .position(|hit| hit.path == path)
+                .unwrap()
+        };
+        assert!(position("y-target.md") < position("a-incidental.md"));
+        assert!(position("y-target.md") < position("a-near-reference.md"));
+        assert!(position("c-topic.md") < position("b-identifier.md"));
+        assert!(position("c-topic.md") < position("d-partial.md"));
+    }
+}
+
+#[tokio::test]
 async fn grouped_recall_keeps_answer_evidence_from_other_files() {
     let fixture = Fixture::new();
     let repeated = (0..BRANCH_LIMIT + 12)
@@ -235,10 +654,7 @@ async fn grouped_recall_keeps_answer_evidence_from_other_files() {
         )
         .await;
 
-    for (query, category) in [
-        ("VXR7310", Category::Exact),
-        ("quartz calibration", Category::Related),
-    ] {
+    for query in ["VXR7310", "quartz calibration"] {
         let reply = search(
             &fixture.catalog,
             request(query, Some("docs"), None),
@@ -250,7 +666,9 @@ async fn grouped_recall_keeps_answer_evidence_from_other_files() {
         .unwrap();
         assert!(
             reply.matches.iter().take(5).any(|hit| {
-                hit.path == "02-procedure.md" && hit.text == answer && hit.category == category
+                hit.path == "02-procedure.md"
+                    && hit.text == answer
+                    && hit.category == Category::Exact
             }),
             "{query}: repeated entries buried the procedure: {:?}",
             paths(&reply)
@@ -422,11 +840,6 @@ async fn hybrid_uses_eligible_pinned_versions_and_scoped_dense_recall() {
     let keyword = search(&fixture.catalog, query(), None, None, FusionMode::Grouped)
         .await
         .unwrap();
-    assert_eq!(
-        server.state.embed_queries.load(Relaxed),
-        1,
-        "only the literal document used this input during import"
-    );
     assert!(!paths(&keyword).contains(&"inside/a.md"));
     let hybrid = search(
         &fixture.catalog,
@@ -462,6 +875,26 @@ async fn hybrid_uses_eligible_pinned_versions_and_scoped_dense_recall() {
     let mut native_paths = paths(&native);
     native_paths.sort_unstable();
     assert_eq!(native_paths, found);
+
+    let rerank = Rerank::new(server.config("rerank")).unwrap();
+    let calls = server.state.embed_queries.load(Relaxed);
+    let literal = search(
+        &fixture.catalog,
+        SearchRequest {
+            strict: true,
+            ..query()
+        },
+        Some(Arc::clone(&provider)),
+        Some(&rerank),
+        FusionMode::Edge,
+    )
+    .await
+    .unwrap();
+    assert_eq!(literal.retrieval, Retrieval::Literal);
+    assert_eq!(paths(&literal), ["inside/keyword.md", "inside/plain.md"]);
+    assert!(!literal.reranked);
+    assert_eq!(server.state.embed_queries.load(Relaxed), calls);
+    assert!(server.state.rerank_documents.lock().unwrap().is_empty());
 
     let mismatched = Arc::new(Embedding::new(server.config("different model"), 2).unwrap());
     let before = server.state.embed_queries.load(Relaxed);
@@ -540,7 +973,7 @@ async fn rerank_reorders_only_its_window_and_survives_embedding_degradation() {
         .collect::<Vec<_>>();
     let mut docs = names
         .iter()
-        .map(|name| (name.as_str(), "C++ zircon amber"))
+        .map(|name| (name.as_str(), "C++17 zircon amber"))
         .collect::<Vec<_>>();
     docs.extend([
         ("mix/ref.md", EXACT_BODY),
@@ -575,7 +1008,6 @@ async fn rerank_reorders_only_its_window_and_survives_embedding_degradation() {
         .take(len)
         .take_while(|item| item.category == Category::Exact)
         .count();
-    expected[..exact].reverse();
     expected[exact..len].reverse();
     assert_eq!(paths(&keyword_ranked), expected);
     assert_ne!(keyword_ranked.matches, keyword.matches);

@@ -515,7 +515,8 @@ fn assert_mcp_fixture(reply: &Value) {
             "matches": [{
                 "text": SOURCE, "library": LIBRARY, "path": SOURCE_PATH,
                 "line_start": 1, "line_end": 5, "category": "exact",
-                "ref": hit["ref"], "truncated": false
+                "ref": hit["ref"], "truncated": false, "section_title": "Example",
+                "match_ranges": [{"line_start": 4, "line_end": 4}]
             }]
         })
     );
@@ -545,10 +546,28 @@ async fn native_mcp_and_web_agree_on_evidence_empty_states_and_missing_segments(
         assert_eq!(tool["annotations"]["destructiveHint"], false);
     }
     assert_eq!(search["inputSchema"]["required"], json!(["query"]));
+    let input = &search["inputSchema"]["properties"];
+    assert_eq!(input["limit"]["minimum"], 1);
+    assert_eq!(input["limit"]["maximum"], 16);
+    assert!(
+        input["cursor"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("next_cursor")
+    );
+    assert!(search["description"].as_str().unwrap().contains("limit"));
     assert_eq!(
         search["outputSchema"]["properties"]["matches"]["maxItems"],
-        5
+        16
     );
+    let output = &search["outputSchema"];
+    let hit_ref = output["properties"]["matches"]["items"]["$ref"]
+        .as_str()
+        .unwrap();
+    let hit = output.pointer(hit_ref.strip_prefix('#').unwrap()).unwrap();
+    let required = hit["required"].as_array().unwrap();
+    assert!(required.contains(&json!("match_ranges")), "{hit}");
+    assert_eq!(hit["properties"]["match_ranges"]["type"], "array");
     assert_eq!(fetch["inputSchema"]["required"], json!(["ref"]));
     assert_eq!(fetch["inputSchema"]["additionalProperties"], false);
     let required = fetch["outputSchema"]["required"].as_array().unwrap();
@@ -563,14 +582,14 @@ async fn native_mcp_and_web_agree_on_evidence_empty_states_and_missing_segments(
         assert!(required.contains(&json!(field)));
     }
     let unknown = mcp
-        .tool("knowledge_search", &json!({"query": "vector", "limit": 3}))
+        .tool("knowledge_search", &json!({"query": "vector", "offset": 3}))
         .await;
     assert_eq!(unknown["result"]["isError"], true, "{unknown}");
     assert!(
         unknown["result"]["content"][0]["text"]
             .as_str()
             .unwrap()
-            .contains("unknown field `limit`")
+            .contains("unknown field `offset`")
     );
     let write = mcp
         .tool("knowledge_create", &json!({"name": "from-mcp"}))
@@ -647,7 +666,8 @@ async fn native_mcp_and_web_agree_on_evidence_empty_states_and_missing_segments(
         fetch,
         json!({
             "text": SOURCE, "library": LIBRARY, "path": SOURCE_PATH,
-            "line_start": 1, "line_end": 5, "truncated": false
+            "line_start": 1, "line_end": 5, "truncated": false,
+            "previous_ref": null, "next_ref": null
         })
     );
     let invalid = mcp.fetch(&json!("../not-a-reference")).await;
@@ -767,7 +787,7 @@ async fn mcp_search_keeps_distinct_sources_and_complete_names_within_budget() {
     let web = service.web_search(&cookie, &query, StatusCode::OK).await;
     let response = mcp.search(&query).await;
     let hits = response["matches"].as_array().unwrap();
-    assert_eq!(hits.len(), 5, "{response}");
+    assert_eq!(hits.len(), 2, "{response}");
     assert!(
         hits.iter()
             .map(|hit| hit["text"].as_str().unwrap().len())
@@ -776,6 +796,7 @@ async fn mcp_search_keeps_distinct_sources_and_complete_names_within_budget() {
     );
     let mut ranked = web["matches"].as_array().unwrap().iter();
     let mut distinct = std::collections::BTreeSet::new();
+    let mut copies = std::collections::BTreeSet::new();
     for hit in hits {
         let path = hit["path"].as_str().unwrap();
         assert!(distinct.insert(path));
@@ -788,6 +809,17 @@ async fn mcp_search_keeps_distinct_sources_and_complete_names_within_budget() {
             "{path} not in shared rank order"
         );
         if path != "wide.md" {
+            copies.insert(path.to_owned());
+            let duplicates = hit["duplicates"].as_array().unwrap();
+            for duplicate in duplicates {
+                let copy_path = duplicate["path"].as_str().unwrap();
+                assert!(copies.insert(copy_path.to_owned()), "{duplicate}");
+                assert_eq!(duplicate["line_start"], hit["line_start"]);
+                assert_eq!(duplicate["line_end"], hit["line_end"]);
+                let fetched = successful_tool(mcp.fetch(&duplicate["ref"]).await);
+                assert_eq!(fetched["path"], copy_path);
+                assert!(fetched["text"].as_str().unwrap().contains(text));
+            }
             let offset = standard.find(text).unwrap();
             let line_start = standard[..offset]
                 .bytes()
@@ -804,6 +836,476 @@ async fn mcp_search_keeps_distinct_sources_and_complete_names_within_budget() {
             assert_eq!(hit["line_end"], line_end);
         }
     }
+    assert_eq!(
+        copies,
+        paths[1..].iter().map(|path| (*path).to_owned()).collect()
+    );
+    service.stop().await;
+}
+
+#[tokio::test]
+async fn mcp_combines_repeated_examples_without_aliasing_different_originals() {
+    let root = tempfile::tempdir().unwrap();
+    let service = Service::start(root.path(), None, None, FusionMode::Grouped).await;
+    let cookie = service.login(EMPLOYEE).await;
+    service.create(&cookie).await;
+    let steps = (1..=18)
+        .map(|step| format!("Step {step}: inspect the timing report for this lane.\r\n"))
+        .collect::<String>();
+    let original = format!("Lane Select example: use -value=1.\r\n{steps}Layout notes.");
+    let copy = format!(
+        "LANE SELECT   EXAMPLE: use -value=1.\n\n{}Constraints notes.",
+        steps.to_ascii_uppercase().replace("\r\n", "\n")
+    );
+    let opposite = format!("Lane Select example: use -value=0.\r\n{steps}Other mode.");
+    let files = [
+        ("original.md", original.as_str()),
+        ("reprint.md", copy.as_str()),
+        ("different.md", opposite.as_str()),
+    ];
+    let upload = files.map(|(path, text)| (path, text.as_bytes()));
+    service.publish(&cookie, &upload).await;
+    let mut mcp = Mcp::connect(&service).await;
+    let response = mcp.search(&json!({"query": "Lane Select"})).await;
+    let hits = response["matches"].as_array().unwrap();
+    assert_eq!(hits.len(), 2, "{response}");
+    let other = hits
+        .iter()
+        .find(|hit| hit["path"] == "different.md")
+        .unwrap();
+    assert!(other["text"].as_str().unwrap().contains("-value=0"));
+    assert!(other["duplicates"].is_null());
+    let primary = hits
+        .iter()
+        .find(|hit| hit["path"] != "different.md")
+        .unwrap();
+    let alternatives = primary["duplicates"].as_array().unwrap();
+    assert_eq!(alternatives.len(), 1, "{primary}");
+    let alternate = &alternatives[0];
+    assert_eq!(alternate["match"], "shared_prefix");
+    assert_ne!(primary["path"], alternate["path"]);
+    let expected = files
+        .iter()
+        .find(|(path, _)| alternate["path"] == *path)
+        .unwrap()
+        .1;
+    let context = successful_tool(mcp.fetch(&alternate["ref"]).await);
+    let text = context["text"].as_str().unwrap();
+    assert_eq!(context["path"], alternate["path"]);
+    assert!(expected.contains(text) && text.contains("-value=1"));
+    assert!(context["line_start"].as_u64() <= alternate["line_start"].as_u64());
+    assert!(context["line_end"].as_u64() >= alternate["line_end"].as_u64());
+    service.stop().await;
+}
+
+#[tokio::test]
+async fn mcp_literal_queries_keep_punctuation_order_and_complete_identifiers() {
+    let root = tempfile::tempdir().unwrap();
+    let service = Service::start(root.path(), None, None, FusionMode::Grouped).await;
+    let cookie = service.login(EMPLOYEE).await;
+    service.create(&cookie).await;
+    service
+        .publish(
+            &cookie,
+            &[
+                ("a-other.md", b"March C+ tmerge. IEEE 1500 TRST optional."),
+                ("b-march.md", b"Run March C- before verification."),
+                ("c-flag.md", b"Simulate with `-xprop=tmerge`."),
+                (
+                    "d-standard.md",
+                    b"Under IEEE 1149.1, TRST is an optional pin.",
+                ),
+                ("e-error.md", b"Error N17: scan chain is not connected."),
+            ],
+        )
+        .await;
+    let mut mcp = Mcp::connect(&service).await;
+    for (query, path) in [
+        ("March C-", "b-march.md"),
+        ("March C+", "a-other.md"),
+        ("-xprop=tmerge", "c-flag.md"),
+        ("IEEE 1149.1", "d-standard.md"),
+        ("Error N17: scan chain is not connected.", "e-error.md"),
+    ] {
+        let ranked = mcp.search(&json!({"query": query})).await;
+        assert_eq!(ranked["matches"][0]["path"], path, "{ranked}");
+        assert_eq!(ranked["matches"][0]["category"], "exact", "{ranked}");
+        let strict = json!({"query": query, "strict": true});
+        let ranked = mcp.search(&strict).await;
+        let hits = ranked["matches"].as_array().unwrap();
+        assert_eq!(hits.len(), 1, "{ranked}");
+        assert_eq!(hits[0]["path"], path, "{ranked}");
+        assert!(hits[0]["text"].as_str().unwrap().contains(query));
+    }
+    let standard = mcp
+        .search(&json!({"query": "IEEE 1149.1 TRST optional"}))
+        .await;
+    assert_eq!(
+        standard["matches"][0]["path"], "d-standard.md",
+        "{standard}"
+    );
+    let missing = json!({"query": "N17999", "strict": true});
+    assert_eq!(mcp.search(&missing).await["matches"], json!([]));
+    let missing = json!({"query": "N17 scan chain", "strict": true});
+    assert_eq!(mcp.search(&missing).await["matches"], json!([]));
+    let strict = json!({"query": "-xprop=tmerge", "strict": true});
+    let web = service.web_search(&cookie, &strict, StatusCode::OK).await;
+    assert_eq!(web["retrieval"], "literal");
+    assert_eq!(web["matches"][0]["path"], "c-flag.md");
+    service.stop().await;
+}
+
+#[tokio::test]
+async fn mcp_exact_rule_search_keeps_late_body_and_ranks_it_above_contents() {
+    let root = tempfile::tempdir().unwrap();
+    let service = Service::start(root.path(), None, None, FusionMode::Grouped).await;
+    let cookie = service.login(EMPLOYEE).await;
+    service.create(&cookie).await;
+    let manual = "\
+# Contents\r\n\
+Check Rule N16 117\r\n\
+Check Rule N17 ................ 118\r\n\
+- [Check Rule N18](#check-rule-n18)\r\n\
+# Fixture netlist\r\n\
+wire N16, N17, N18;\r\n\
+# Upgrade notes\r\n\
+See N17 for a previously documented check.\r\n\
+# Check Rule N16\r\n\
+Warning: the synthetic amber input has no reference.\r\n\
+Connect the reference before running the fixture.\r\n\
+# Check Rule N17\r\n\
+Error N17: the synthetic violet input is unconnected.\r\n\
+Connect the violet input to the dummy loop.\r\n\
+# Check Rule N18\r\n\
+Error N18: the synthetic magenta output is reserved.\r\n\
+Use the spare output in the dummy loop.\r\n";
+    service
+        .publish(
+            &cookie,
+            &[
+                ("manual.md", manual.as_bytes()),
+                ("other.md", b"Check Rule N170 is a different check."),
+            ],
+        )
+        .await;
+    let mut mcp = Mcp::connect(&service).await;
+    let body = "Error N17: the synthetic violet input is unconnected.";
+    let known = mcp
+        .search(&json!({"query": body, "strict": true, "path": "manual.md"}))
+        .await;
+    assert!(known["matches"][0]["text"].as_str().unwrap().contains(body));
+    for (code, line, title, expected) in [
+        (
+            "N16",
+            9,
+            "Check Rule N16",
+            "the synthetic amber input has no reference.",
+        ),
+        ("N17", 12, "Check Rule N17", body),
+        (
+            "N18",
+            15,
+            "Check Rule N18",
+            "the synthetic magenta output is reserved.",
+        ),
+    ] {
+        for query in [code, title] {
+            let mut exact = Vec::new();
+            for strict in [false, true] {
+                let result = mcp
+                    .search(&json!({"query": query, "strict": strict, "path": "manual.md"}))
+                    .await;
+                let hits = result["matches"].as_array().unwrap();
+                let first = &hits[0];
+                assert_eq!(
+                    first["category"], "exact",
+                    "{query} strict={strict}: {first}"
+                );
+                assert_eq!(first["section_title"], title);
+                assert_eq!(
+                    first["match_ranges"][0],
+                    json!({"line_start": line, "line_end": line})
+                );
+                let shown = first["text"].as_str().unwrap();
+                assert!(shown.contains(expected), "{query} strict={strict}: {first}");
+                let excerpt = successful_tool(mcp.fetch(&first["ref"]).await);
+                assert!(excerpt["text"].as_str().unwrap().contains(shown));
+                exact.push(
+                    hits.iter()
+                        .filter(|hit| hit["category"] == "exact")
+                        .map(|hit| (hit["path"].clone(), hit["match_ranges"].clone()))
+                        .collect::<Vec<_>>(),
+                );
+            }
+            assert_eq!(exact[0], exact[1], "{query}");
+        }
+    }
+    service.stop().await;
+}
+
+#[tokio::test]
+async fn exact_mentions_outrank_contents_links_and_index_rows() {
+    let root = tempfile::tempdir().unwrap();
+    let service = Service::start(root.path(), None, None, FusionMode::Grouped).await;
+    let cookie = service.login(EMPLOYEE).await;
+    service.create(&cookie).await;
+    service
+        .publish(
+            &cookie,
+            &[
+                ("a.md", b"# Contents\n\n- [QX-7](z.md)\n"),
+                (
+                    "b.md",
+                    b"# Index\n\n| Rule | File |\n| --- | --- |\n| QX-7 | z-rule |\n",
+                ),
+                (
+                    "c.md",
+                    b"# Reminders\n\nSee QX-7 before opening the shutter.\n",
+                ),
+                ("z.md", b"## QX-7\n\nClose the shutter and lock the pin.\n"),
+            ],
+        )
+        .await;
+    let mut mcp = Mcp::connect(&service).await;
+    for strict in [false, true] {
+        let query = json!({"query": "QX-7", "strict": strict});
+        for result in [
+            service.web_search(&cookie, &query, StatusCode::OK).await,
+            mcp.search(&query).await,
+        ] {
+            let exact: Vec<_> = result["matches"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|hit| hit["category"] == "exact")
+                .map(|hit| hit["path"].as_str().unwrap())
+                .collect();
+            assert_eq!(exact, ["z.md", "c.md", "a.md", "b.md"], "{result}");
+        }
+    }
+    service.stop().await;
+}
+
+#[tokio::test]
+async fn mcp_search_pages_past_old_result_and_file_limits() {
+    let root = tempfile::tempdir().unwrap();
+    let service = Service::start(root.path(), None, None, FusionMode::Grouped).await;
+    let cookie = service.login(EMPLOYEE).await;
+    service.create(&cookie).await;
+    let manual = (1..=21)
+        .map(|id| format!("## Fixture {id}\n\nP713 controls the test output on lane {id}.\n\n"))
+        .collect::<String>();
+    service
+        .publish(&cookie, &[("manual.md", manual.as_bytes())])
+        .await;
+    let mut mcp = Mcp::connect(&service).await;
+    let mut args = json!({"query": "P713", "strict": true, "limit": 3, "path": "manual.md"});
+    let mut first_cursor = None;
+    let mut seen = std::collections::BTreeSet::new();
+    for page in 0..=7 {
+        let result = mcp.search(&args).await;
+        let hits = result["matches"].as_array().unwrap();
+        assert_eq!(hits.len(), 3, "{result}");
+        for hit in hits {
+            assert_eq!(hit["category"], "exact");
+            let matched = hit["match_ranges"][0]["line_start"].as_u64().unwrap();
+            assert!(seen.insert(matched), "repeated hit from line {matched}");
+            assert_eq!(hit["match_ranges"][0]["line_end"], matched);
+            assert_eq!(
+                hit["section_title"],
+                format!("Fixture {}", (matched + 1) / 4)
+            );
+        }
+        if page == 0 {
+            first_cursor = result["next_cursor"].as_str().map(str::to_owned);
+        }
+        if let Some(cursor) = result["next_cursor"].as_str() {
+            args["cursor"] = json!(cursor);
+        } else {
+            break;
+        }
+        assert!(page < 6, "cursor did not terminate after all 21 hits");
+    }
+    assert_eq!(seen, (1..=21).map(|n| 4 * n - 1).collect());
+    let first_cursor = first_cursor.expect("first page offers continuation");
+    let mismatch = mcp
+        .tool(
+            "knowledge_search",
+            &json!({"query": "P714", "strict": true, "limit": 3, "path": "manual.md", "cursor": first_cursor}),
+        )
+        .await;
+    assert_eq!(mismatch["error"]["code"], -32602, "{mismatch}");
+    let malformed = mcp
+        .tool(
+            "knowledge_search",
+            &json!({"query": "P713", "cursor": "bad"}),
+        )
+        .await;
+    assert_eq!(malformed["error"]["code"], -32602, "{malformed}");
+    assert!(
+        malformed["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("without a cursor"),
+        "{malformed}"
+    );
+    let invalid_limit = mcp
+        .tool("knowledge_search", &json!({"query": "P713", "limit": 17}))
+        .await;
+    assert!(
+        invalid_limit["error"].is_object() || invalid_limit["result"]["isError"] == true,
+        "{invalid_limit}"
+    );
+    service
+        .publish(&cookie, &[("manual.md", manual.as_bytes())])
+        .await;
+    let stale = mcp
+        .tool(
+            "knowledge_search",
+            &json!({"query": "P713", "strict": true, "limit": 3, "path": "manual.md", "cursor": first_cursor}),
+        )
+        .await;
+    assert_eq!(stale["error"]["code"], -32602, "{stale}");
+    service.stop().await;
+}
+
+#[tokio::test]
+async fn mcp_search_resumes_a_hit_deferred_by_the_byte_budget() {
+    let root = tempfile::tempdir().unwrap();
+    let service = Service::start(root.path(), None, None, FusionMode::Grouped).await;
+    let cookie = service.login(EMPLOYEE).await;
+    service.create(&cookie).await;
+    let query = "calibrate the dummy channel ".repeat(110) + "now";
+    let first = format!("# Amber procedure\n{query}\n");
+    let second = format!("# Violet procedure\n{query}\n");
+    service
+        .publish(
+            &cookie,
+            &[("a.md", first.as_bytes()), ("b.md", second.as_bytes())],
+        )
+        .await;
+    let mut mcp = Mcp::connect(&service).await;
+    let args = json!({"query": query, "strict": true, "limit": 2});
+    let first = mcp.search(&args).await;
+    let cursor = first["next_cursor"].as_str().expect("more evidence");
+    let mut resumed = args;
+    resumed["cursor"] = json!(cursor);
+    let second = mcp.search(&resumed).await;
+    for (page, path) in [(&first, "a.md"), (&second, "b.md")] {
+        let hits = page["matches"].as_array().unwrap();
+        assert_eq!(hits.len(), 1, "{path}");
+        assert_eq!(hits[0]["path"], path);
+        assert!(hits[0]["text"].as_str().unwrap().contains(&query));
+    }
+    assert!(second["next_cursor"].is_null());
+    service.stop().await;
+}
+
+#[tokio::test]
+async fn mcp_match_lines_inherit_the_real_heading_across_a_fenced_split() {
+    let root = tempfile::tempdir().unwrap();
+    let service = Service::start(root.path(), None, None, FusionMode::Grouped).await;
+    let cookie = service.login(EMPLOYEE).await;
+    service.create(&cookie).await;
+    let query = "Fictional check\r\nreports a missing part";
+    let source = format!(
+        "# Verified section\r\n```text\r\n# Not a section\r\n{}\r\n{query}\r\n```\r\n",
+        "x".repeat(18_010)
+    );
+    service
+        .publish(&cookie, &[("fixture.md", source.as_bytes())])
+        .await;
+    let mut mcp = Mcp::connect(&service).await;
+    let result = mcp.search(&json!({"query": query, "strict": true})).await;
+    let hit = &result["matches"][0];
+    assert_eq!(hit["section_title"], "Verified section", "{result}");
+    assert_eq!(
+        hit["match_ranges"],
+        json!([{"line_start": 5, "line_end": 6}])
+    );
+    assert!(hit["text"].as_str().unwrap().contains(query));
+    service.stop().await;
+}
+
+#[tokio::test]
+async fn mcp_finds_a_late_heading_without_treating_fenced_text_as_a_heading() {
+    let root = tempfile::tempdir().unwrap();
+    let service = Service::start(root.path(), None, None, FusionMode::Grouped).await;
+    let cookie = service.login(EMPLOYEE).await;
+    service.create(&cookie).await;
+    let prelude = "Synthetic filler for a merged reference.\r\n".repeat(8_000);
+    let source = format!(
+        "# Prelude\r\n{prelude}\r\n\
+         ## Local context\r\nA short synthetic introduction.\r\n\r\n\
+         ### Rule Z47\r\n\r\nThe synthetic monitor watches the spare lane.\r\n\
+         ```text\r\n{}\r\n### FencedLookalike47\r\n```\r\n",
+        "fence contents for a synthetic source\r\n".repeat(600)
+    );
+    let last_section = format!(
+        "{}\n# Last section\nLocal proof for synthetic EOF marker T9R.\n",
+        ("x".repeat(99) + "\n").repeat(2_701)
+    );
+    service
+        .publish(
+            &cookie,
+            &[
+                ("merged.md", source.as_bytes()),
+                ("tail.md", last_section.as_bytes()),
+                ("z-next-file.md", b"# A different source\nUnrelated text.\n"),
+            ],
+        )
+        .await;
+    let mut mcp = Mcp::connect(&service).await;
+    for query in ["Rule Z47", "FencedLookalike47"] {
+        let result = mcp.search(&json!({"query": query, "strict": true})).await;
+        let hit = &result["matches"][0];
+        assert_eq!(hit["section_title"], "Rule Z47", "{result}");
+        assert!(hit["match_ranges"][0]["line_start"].as_u64().unwrap() > 8_000);
+    }
+    let result = mcp
+        .search(&json!({"query": "T9R", "strict": true, "path": "tail.md"}))
+        .await;
+    let hit = &result["matches"][0];
+    assert_eq!(hit["section_title"], "Last section", "{result}");
+    assert_eq!(
+        hit["match_ranges"],
+        json!([{"line_start": 2704, "line_end": 2704}])
+    );
+    service.stop().await;
+}
+
+#[tokio::test]
+async fn mcp_related_fetch_preserves_shown_bytes_and_pages_both_directions() {
+    let root = tempfile::tempdir().unwrap();
+    let service = Service::start(root.path(), None, None, FusionMode::Grouped).await;
+    let cookie = service.login(EMPLOYEE).await;
+    service.create(&cookie).await;
+    let mut source = String::from("# Prelude\r\n");
+    for line in 1..=32 {
+        source.push_str(&format!("Prelude {line} 中文\r\n"));
+    }
+    source.push_str("# Evidence\r\nalpha beta\r\n");
+    for line in 1..=80 {
+        source.push_str(&format!("Evidence {line} 中文\r\n"));
+    }
+    service
+        .publish(&cookie, &[("source.md", source.as_bytes())])
+        .await;
+    let mut mcp = Mcp::connect(&service).await;
+    let ranked = mcp.search(&json!({"query": "beta alpha"})).await;
+    let hit = &ranked["matches"][0];
+    assert_eq!(hit["category"], "related", "{ranked}");
+    assert_eq!(hit["match_ranges"], json!([]), "{ranked}");
+    let context = successful_tool(mcp.fetch(&hit["ref"]).await);
+    let middle = context["text"].as_str().unwrap();
+    assert!(middle.contains(hit["text"].as_str().unwrap()));
+    assert!(context["line_end"].as_u64().unwrap() - context["line_start"].as_u64().unwrap() < 60);
+    let previous = successful_tool(mcp.fetch(&context["previous_ref"]).await);
+    let next = successful_tool(mcp.fetch(&context["next_ref"]).await);
+    let before = previous["text"].as_str().unwrap();
+    let after = next["text"].as_str().unwrap();
+    assert_eq!(format!("{before}{middle}{after}"), source);
+    assert!(previous["previous_ref"].is_null() && next["next_ref"].is_null());
     service.stop().await;
 }
 
@@ -837,6 +1339,7 @@ async fn mcp_fetch_reopens_existing_fragments_and_rejects_retired_refs() {
     let mut mcp = Mcp::connect(&service).await;
     let query = json!({"query": "std::vector", "path": "overlap.md"});
     let hit = mcp.search(&query).await;
+    let wide_shown = hit["matches"][0]["text"].as_str().unwrap();
     let wide_ref = &hit["matches"][0]["ref"];
     let hit = mcp
         .search(&json!({"query": "std::vector", "path": "lines.md"}))
@@ -849,7 +1352,16 @@ async fn mcp_fetch_reopens_existing_fragments_and_rejects_retired_refs() {
     let context = successful_tool(mcp.fetch(wide_ref).await);
     let text = context["text"].as_str().unwrap();
     assert!((4093..=4096).contains(&text.len()));
-    assert!(text.contains("left_marker") && text.contains("right_marker") && wide.contains(text));
+    assert!(text.contains(wide_shown) && wide.contains(text));
+    let previous = successful_tool(mcp.fetch(&context["previous_ref"]).await);
+    let next = successful_tool(mcp.fetch(&context["next_ref"]).await);
+    let adjacent = format!(
+        "{}{text}{}",
+        previous["text"].as_str().unwrap(),
+        next["text"].as_str().unwrap()
+    );
+    assert!(wide.contains(&adjacent));
+    assert!(adjacent.contains("left_marker") && adjacent.contains("right_marker"));
     assert_eq!(context["path"], "overlap.md");
     assert_eq!(context["line_start"], 2);
     assert_eq!(context["line_end"], 2);
