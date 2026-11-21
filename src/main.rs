@@ -9,6 +9,8 @@ mod import;
 mod index;
 mod markdown;
 mod mcp;
+#[cfg(target_os = "linux")]
+mod model_defaults;
 mod model_http;
 mod search;
 mod settings;
@@ -106,6 +108,8 @@ async fn serve(settings: Settings, mode: RunMode) -> Result<(), Box<dyn Error>> 
     if matches!(mode, RunMode::Daemon) {
         daemon::redirect_log(root.path())?;
     }
+    #[cfg(target_os = "linux")]
+    let (embedding, rerank) = model_defaults::resolve(embedding, rerank);
     let catalog = Arc::new(catalog::Catalog::open(root)?);
     let audit = Arc::new(audit::Audit::open(catalog.root_path(), &catalog)?);
     let shutdown = shutdown_signal().map_err(|error| {

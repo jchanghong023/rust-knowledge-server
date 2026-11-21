@@ -8,21 +8,37 @@
   <script src="/app.js" defer></script>
 </head>
 <body>
-  <header class="masthead">
-    <div class="page masthead-inner">
-      <div>
-        <h1>知识库工作台</h1>
-        <p>管理共享 Markdown 文档，检索并核对原文。</p>
-      </div>
-      <div class="masthead-actions">
-        <a id="activity-link" href="#activity">活动记录</a>
-        <p id="current-employee" class="identity" hidden></p>
-      </div>
-    </div>
-  </header>
-  <main class="page">
-    <noscript><p>请启用 JavaScript 后使用工作台。</p></noscript>
-    <p id="session-check" role="status">正在检查登记会话…</p>
+  <a class="skip-link" href="#main-content">跳到内容</a>
+  <div class="app-shell">
+    <aside class="masthead">
+      <a class="brand" href="#workbench">
+        <span class="brand-mark">
+          <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round">
+            <path d="m3 8 9-4 9 4-9 4-9-4Zm0 4 9 4 9-4M3 16l9 4 9-4"/>
+          </svg>
+        </span>
+        <span>知识库工作台</span>
+      </a>
+      <nav class="site-nav" aria-label="主导航">
+        <a id="workbench-link" href="#workbench" aria-current="page">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="7" height="16" rx="1"/><rect x="15" y="4" width="5" height="7" rx="1"/><rect x="15" y="15" width="5" height="5" rx="1"/></svg>
+          工作台
+        </a>
+        <a id="activity-link" href="#activity">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="4" width="14" height="16" rx="2"/><path d="M9 9h6m-6 3h6m-6 3h4"/></svg>
+          活动记录
+        </a>
+      </nav>
+      <p id="current-employee" class="identity" hidden></p>
+    </aside>
+    <main id="main-content" class="page" tabindex="-1">
+      <noscript><p>请启用 JavaScript 后使用工作台。</p></noscript>
+      <div id="workbench-view">
+        <header class="page-heading">
+          <h1 tabindex="-1">知识库工作台</h1>
+          <p>管理共享 Markdown 文档，检索并核对原文。</p>
+        </header>
+        <p id="session-check" role="status">正在检查登记会话…</p>
 
     <section id="registration" class="panel registration" aria-labelledby="registration-title" hidden>
       <h2 id="registration-title">登记工号</h2>
@@ -37,7 +53,7 @@
       <p id="registration-status" class="message" role="status"></p>
     </section>
 
-    <div id="workbench" class="workspace" hidden>
+    <div id="workspace" class="workspace" hidden>
       <section class="panel" aria-labelledby="libraries-title">
         <div class="section-heading">
           <h2 id="libraries-title">知识库</h2>
@@ -116,15 +132,42 @@
         </section>
       </section>
     </div>
+      </div>
 
-    <details id="activity" class="panel activity">
-      <summary><h2>活动记录</h2></summary>
-      <p class="hint">以下为最近 30 天成功登记的自报工号，不代表已验证身份或当前在线。展开工号可查看其仍保留的知识库操作。</p>
-      <button id="refresh-activity" type="button">刷新记录</button>
-      <p id="activity-status" class="message" role="status"></p>
-      <ul id="activity-roster" aria-label="最近 30 天登记工号"></ul>
-    </details>
-  </main>
+      <section id="activity-view" aria-labelledby="activity-title" hidden>
+        <header class="page-heading">
+          <h1 id="activity-title" tabindex="-1">活动记录</h1>
+          <p>展开工号，查看对应的知识库操作。</p>
+        </header>
+        <div class="activity-layout">
+          <section class="panel roster-panel" aria-labelledby="roster-title">
+            <div class="roster-toolbar">
+              <div>
+                <h2 id="roster-title" tabindex="-1">登记清册</h2>
+                <p id="activity-status" class="message" role="status"></p>
+              </div>
+              <button id="refresh-activity" class="with-icon" type="button">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 9a7 7 0 1 0 .1 5M19 4v5h-5"/></svg>
+                刷新记录
+              </button>
+            </div>
+            <div id="activity-columns" class="roster-grid roster-columns" aria-hidden="true" hidden>
+              <span>自报工号</span><span>最后登记时间</span>
+            </div>
+            <ul id="activity-roster" aria-label="最近 30 天登记工号"></ul>
+          </section>
+          <aside class="scope-note" aria-labelledby="scope-title">
+            <div class="scope-heading">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="6" width="16" height="14" rx="2"/><path d="M8 4v4m8-4v4M4 11h16m-12 4h3"/></svg>
+              <h2 id="scope-title">最近 30 天</h2>
+            </div>
+            <p>仅显示最近 30 天成功登记的自报工号，不代表已验证身份或当前在线。</p>
+            <p>无需登记即可查看。展开工号后可查看仍保留的操作及结果。</p>
+          </aside>
+        </div>
+      </section>
+    </main>
+  </div>
 
   <dialog id="confirmation" aria-labelledby="confirmation-title" aria-describedby="confirmation-message">
     <form method="dialog">

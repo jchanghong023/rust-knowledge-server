@@ -33,7 +33,7 @@ Rust Knowledge Server：从 Web 导入 Markdown，通过 Web 和只读 MCP 搜�
                进程重启可复用，机器重启后清空；请自行保管 Markdown 并重新导入。
   同一目录只能由一个进程使用。
 
-模型选项（均默认关闭，支持 HTTP(S) API，互不依赖）：
+模型选项（未显式配置且未自动启用时关闭，支持 HTTP(S) API）：
   --embedding-url <URL>         Embedding API 基址，可带 /v1
   --embedding-model <NAME>      Embedding 模型名
   --embedding-dimensions <N>    正整数，须与模型维度相同；启用时前三项必填
@@ -64,6 +64,14 @@ CentOS 7 后台管理（无需 root）：
   rust-knowledge-server stop             正常停机并等待收尾
   直接运行仍为前台模式；后台日志：/dev/shm/rust-knowledge-server/daemon.log。
   不负责异常退出后拉起或开机自启。
+
+模型自动配置：
+  已有 OMP_OFFLINE=1 和有效 Claude Code 网关配置时，前台与 start 无需模型参数。
+  只读 ~/.claude/settings.json（或 $CLAUDE_CONFIG_DIR/settings.json）的
+  env.ANTHROPIC_BASE_URL 和 env.ANTHROPIC_AUTH_TOKEN；配置变更须重启。
+  默认 Qwen3-Embedding-8B（4096 维）和 Qwen3-Reranker-8B。
+  显式模型参数分别优先，不沿用网关 Token。网关配置不可用时保留全文。
+  Token 仅发往配置的网关，不写入服务数据或日志；只使用获准发送的资料。
 ";
 
 #[cfg(target_os = "linux")]

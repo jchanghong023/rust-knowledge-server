@@ -1,0 +1,74 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-11-21T11:08:12Z",
+  "title": "Design System: 知识库工作台",
+  "extensions": {
+    "colorMeta": {
+      "rail": { "role": "neutral", "displayName": "深蓝导航" },
+      "primary": { "role": "primary", "displayName": "钴蓝操作" },
+      "wash": { "role": "neutral", "displayName": "浅蓝明细" }
+    },
+    "motion": [
+      { "name": "row-disclosure", "value": "transform 150ms ease-out", "purpose": "展开操作明细时旋转箭头；减少动态效果时禁用。" }
+    ],
+    "breakpoints": [
+      { "name": "stack-scope", "value": "68rem" },
+      { "name": "top-navigation", "value": "55rem" },
+      { "name": "single-column", "value": "42rem" }
+    ]
+  },
+  "components": [
+    {
+      "name": "主操作",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "登记、上传与搜索。",
+      "html": "<button class=\"ds-primary\">搜索</button>",
+      "css": ".ds-primary{min-height:2.625rem;padding:.45rem .85rem;border:1px solid var(--primary,#244fc4);border-radius:.5rem;background:var(--primary,#244fc4);color:var(--surface,#fff);font:650 .875rem system-ui;cursor:pointer}.ds-primary:not(:disabled):is(:hover,:active){background:var(--primary-hover,#1d3e9e)}.ds-primary:focus-visible{outline:2px solid var(--focus,#244fc4);outline-offset:3px}.ds-primary:disabled{opacity:.66;cursor:not-allowed}"
+    },
+    {
+      "name": "次要操作",
+      "kind": "button",
+      "refersTo": "button-secondary",
+      "description": "刷新与取消等可逆操作。",
+      "html": "<button class=\"ds-secondary\">刷新记录</button>",
+      "css": ".ds-secondary{min-height:2.625rem;padding:.45rem .85rem;border:1px solid var(--control,#8598b0);border-radius:.5rem;background:var(--surface,#fff);color:var(--ink,#172941);font:650 .875rem system-ui;cursor:pointer}.ds-secondary:not(:disabled):hover{background:var(--wash,#f3f7fd)}.ds-secondary:not(:disabled):active{background:#e2ebfa}.ds-secondary:focus-visible{outline:2px solid var(--focus,#244fc4);outline-offset:3px}.ds-secondary:disabled{opacity:.66;cursor:not-allowed}"
+    },
+    {
+      "name": "删除确认",
+      "kind": "button",
+      "description": "仅在确认对话框中执行删除。",
+      "html": "<button class=\"ds-danger\">确认删除</button>",
+      "css": ".ds-danger{min-height:2.625rem;padding:.45rem .85rem;border:1px solid var(--danger,#9a303e);border-radius:.5rem;background:var(--danger,#9a303e);color:var(--surface,#fff);font:650 .875rem system-ui;cursor:pointer}.ds-danger:is(:hover,:active){background:#782631}.ds-danger:focus-visible{outline:2px solid var(--focus,#244fc4);outline-offset:3px}"
+    },
+    {
+      "name": "文本输入",
+      "kind": "input",
+      "description": "保留原生输入语义与清晰焦点。",
+      "html": "<label class=\"ds-label\">搜索内容<input class=\"ds-input\" type=\"search\"></label>",
+      "css": ".ds-label{display:grid;gap:.35rem;color:var(--ink,#172941);font:650 .875rem system-ui}.ds-input{min-height:2.625rem;padding:.45rem .65rem;border:1px solid var(--control,#8598b0);border-radius:.5rem;background:var(--surface,#fff);color:inherit;font:1rem system-ui;caret-color:var(--primary,#244fc4)}.ds-input:focus-visible{outline:2px solid var(--focus,#244fc4);outline-offset:3px}"
+    },
+    {
+      "name": "当前导航项",
+      "kind": "nav",
+      "description": "深蓝区域内用浅一阶蓝色表示当前页面。",
+      "html": "<nav class=\"ds-nav\" aria-label=\"主导航\"><a class=\"ds-link\" href=\"/#activity\" aria-current=\"page\">活动记录</a></nav>",
+      "css": ".ds-nav{background:var(--rail,#142945);padding:1rem}.ds-link{display:block;padding:.5rem .75rem;border:1px solid transparent;border-radius:.5rem;color:var(--rail-quiet,#b6c7df);font:600 .9375rem system-ui;text-decoration:none}.ds-link:hover{background:#1c3658;color:var(--rail-ink,#eaf2ff)}.ds-link[aria-current=page]{border-color:#40669a;background:var(--rail-active,#254976);color:var(--rail-ink,#eaf2ff)}.ds-link:focus-visible{outline:2px solid #b7d4ff;outline-offset:3px}"
+    },
+    {
+      "name": "工作面板",
+      "kind": "card",
+      "refersTo": "panel",
+      "description": "白色主面用分隔线而非阴影划分区域。",
+      "html": "<section class=\"ds-panel\"><h2 class=\"ds-title\">知识库</h2></section>",
+      "css": ".ds-panel{padding:1.5rem;border:1px solid var(--divider,#d5e0ee);border-radius:.75rem;background:var(--surface,#fff);color:var(--ink,#172941)}.ds-title{margin:0;font:700 1.1875rem/1.3 system-ui}"
+    }
+  ],
+  "narrative": {
+    "northStar": "蓝晒索引",
+    "overview": "深蓝导航定位工作区域，浅蓝底区分页面与白色主面。操作明细在工号下方原位显示，不打断查询。",
+    "keyCharacteristics": ["等宽数字对齐", "位置不变的行内明细", "用文字说明操作结果"],
+    "dos": ["保留窄屏表格的全部字段。"],
+    "donts": ["不把工号当作身份凭证或在线状态。"]
+  }
+}

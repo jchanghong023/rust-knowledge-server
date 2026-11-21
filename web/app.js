@@ -3,7 +3,8 @@
 const byId = (id) => document.getElementById(id);
 const registration = byId("registration");
 const employeeInput = byId("employee");
-const workbench = byId("workbench");
+const workbench = byId("workspace");
+const workbenchView = byId("workbench-view");
 const libraryList = byId("library-list");
 const refreshButton = byId("refresh-libraries");
 const searchLibrary = byId("search-library");
@@ -81,7 +82,7 @@ function showRegistration(note = "") {
   workbench.hidden = true;
   registration.hidden = false;
   message("registration-status", note, note ? "error" : "info");
-  employeeInput.focus();
+  if (!workbenchView.hidden && document.activeElement === document.body) employeeInput.focus();
 }
 
 function activateSession(session, focusWorkbench = false) {
@@ -328,7 +329,10 @@ function evidenceResult(hit) {
   return item;
 }
 
-const activity = byId("activity");
+const activity = byId("activity-view");
+const activityLink = byId("activity-link");
+const workbenchLink = byId("workbench-link");
+const activityColumns = byId("activity-columns");
 const activityRefresh = byId("refresh-activity");
 const activityRoster = byId("activity-roster");
 const activityActions = { create: "创建", import: "导入", delete: "删除", search: "搜索" };
@@ -364,7 +368,10 @@ function operationTable(events, employeeNumber) {
     row.insertCell().append(timestamp(event.started_at_ms));
     row.insertCell().textContent = activityActions[event.action];
     row.insertCell().textContent = event.library ?? (event.action === "search" ? "全部知识库" : "—");
-    row.insertCell().textContent = activityOutcomes[event.outcome];
+    const outcome = element("span", activityOutcomes[event.outcome]);
+    outcome.className = "event-outcome";
+    outcome.dataset.outcome = event.outcome;
+    row.insertCell().append(outcome);
   }
   return table;
 }
@@ -374,13 +381,23 @@ function activityEmployee({ employee: number, last_registered_at_ms }, expanded)
   const details = element("details");
   details.dataset.employee = number;
   const summary = element("summary");
-  summary.append(element("strong", number), timestamp(last_registered_at_ms));
+  summary.className = "roster-grid";
+  const registrationTime = timestamp(last_registered_at_ms);
+  const registrationLabel = element("span", "最后登记时间：");
+  registrationLabel.className = "visually-hidden";
+  const arrow = element("span");
+  arrow.className = "row-arrow";
+  arrow.setAttribute("aria-hidden", "true");
+  summary.append(element("strong", number), registrationLabel, registrationTime, arrow);
+  const detail = element("div");
+  detail.className = "roster-detail";
   const status = element("p");
   status.id = `activity-status-${number}`;
   status.className = "message";
   status.setAttribute("role", "status");
   const history = element("div");
-  details.append(summary, status, history);
+  detail.append(status, history);
+  details.append(summary, detail);
   row.append(details);
   let loading = false;
   details.addEventListener("toggle", async () => {
@@ -411,9 +428,18 @@ async function refreshActivity() {
     const employees = await request("/api/activity", { credentials: "omit" });
     const expanded = new Set(Array.from(
       activityRoster.querySelectorAll("details[open]"), (details) => details.dataset.employee));
+    const focused = activityRoster.contains(document.activeElement)
+      ? document.activeElement.closest("details")?.dataset.employee : null;
+    let nextFocus;
     const rows = document.createDocumentFragment();
-    for (const employee of employees) rows.append(activityEmployee(employee, expanded.has(employee.employee)));
+    for (const employee of employees) {
+      const row = activityEmployee(employee, expanded.has(employee.employee));
+      if (employee.employee === focused) nextFocus = row.querySelector("summary");
+      rows.append(row);
+    }
     activityRoster.replaceChildren(rows);
+    activityColumns.hidden = !employees.length;
+    if (focused) (nextFocus || byId("roster-title")).focus();
     message("activity-status", employees.length ? `共 ${employees.length} 个自报工号。` : "最近 30 天暂无成功登记。");
   } catch (error) {
     const action = activityRoster.childElementCount
@@ -425,13 +451,30 @@ async function refreshActivity() {
   }
 }
 
-byId("activity-link").addEventListener("click", () => {
-  if (activity.open) void refreshActivity();
-  else activity.open = true;
+function renderView(moveFocus = false) {
+  const showActivity = location.hash === "#activity";
+  const changed = activity.hidden === showActivity;
+  activity.hidden = !showActivity;
+  workbenchView.hidden = showActivity;
+  const currentLink = showActivity ? activityLink : workbenchLink;
+  const otherLink = showActivity ? workbenchLink : activityLink;
+  currentLink.setAttribute("aria-current", "page");
+  otherLink.removeAttribute("aria-current");
+  document.title = showActivity ? "活动记录 · 知识库工作台" : "知识库工作台";
+  if (moveFocus && changed) {
+    window.scrollTo(0, 0);
+    (showActivity ? activity : workbenchView).querySelector("h1").focus({ preventScroll: true });
+  }
+  if (showActivity && changed) void refreshActivity();
+}
+
+document.querySelector(".skip-link").addEventListener("click", (event) => {
+  event.preventDefault();
+  byId("main-content").focus();
 });
-activity.addEventListener("toggle", () => { if (activity.open) void refreshActivity(); });
+window.addEventListener("hashchange", () => renderView(true));
 activityRefresh.addEventListener("click", () => void refreshActivity());
-if (location.hash === "#activity") activity.open = true;
+renderView();
 
 async function start() {
   try {

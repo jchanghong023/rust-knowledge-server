@@ -15,13 +15,31 @@
 - **THEN** 该文件独立启动 HTTP 服务，提供浏览器与 MCP 入口，无需另行安装或启动数据库，也不对外监听数据库接口
 - **AND** 进程退出或更换可执行文件不改变索引和操作记录；数据目录仍在时，重新启动可继续使用
 
-### Requirement: 无配置文件启动
+### Requirement: 无须独立配置文件启动
 
-监听地址、MCP Origin、检索融合模式及可选的 Embedding 和 Rerank MUST 只通过命令行设置。服务 MUST NOT 读取配置文件或数据根覆盖环境变量，也 MUST NOT 提供数据路径或手动配置允许主机的参数。
+监听地址、MCP Origin 和检索融合模式 MUST 只通过命令行设置。Embedding 和 Rerank 可通过命令行独立配置；唯一的配置文件例外是 CentOS 7 在 `OMP_OFFLINE=1` 时只读复用现有 Claude Code 用户配置来提供模型默认值。服务 MUST NOT 引入独立配置文件、读取数据根覆盖环境变量或提供数据路径及手动配置允许主机的参数。
 
 #### Scenario: 直接查看帮助与拒绝无效参数
 - **WHEN** 用户运行 `--help`，或传入未知、不完整或无效的启动参数
 - **THEN** 帮助成功退出并列出启用项、默认值、参数依赖、各平台固定数据根、数据保留规则及 Web/MCP 使用方式；无效参数明确失败，不监听端口、不初始化数据目录、不回显密钥
+
+#### Scenario: CentOS 7 零额外配置启动模型
+- **WHEN** CentOS 7 x64 的启动进程已继承 `OMP_OFFLINE=1`，启动账号已有有效 Claude Code 网关配置，且未显式配置模型
+- **THEN** 前台直接运行和后台 `start` 均无需模型参数、新配置文件或另填密钥；只在启动时读取 `$CLAUDE_CONFIG_DIR/settings.json`（该变量未设置或为空时使用启动账号的 `~/.claude/settings.json`）中的 `env.ANTHROPIC_BASE_URL` 和 `env.ANTHROPIC_AUTH_TOKEN`，变更配置须重启
+- **AND** 保留网关路径前缀，以该 HTTP(S) 基址调用 `/v1/embeddings` 的 `Qwen3-Embedding-8B`（4096 维）和 `/v1/rerank` 的 `Qwen3-Reranker-8B`，使用该 Token 的 Bearer 认证；不在启动时探测网关，不猜测其他地址、不回退公网，不把 Token 加入启动参数、写入服务数据或打印到日志
+- **AND** 已有纯全文索引仍可查询；从原始 Markdown 重导生成完整兼容向量后方可获得语义召回，不自动重导
+
+#### Scenario: 显式模型配置独立优先
+- **WHEN** CentOS 7 的启动进程已继承 `OMP_OFFLINE=1`，且显式提供任一模型的命令行参数
+- **THEN** 对该模型仍按命令行要求独立校验和配置，不以网关配置补齐部分参数，也不继承其中的 Token；未显式配置的另一模型仍可采用自动配置
+
+#### Scenario: 不自动配置模型
+- **WHEN** 使用 Windows、CentOS 7 启动进程未继承 `OMP_OFFLINE=1`，或运行帮助、`status`、`stop`
+- **THEN** 不为模型自动启用读取 Claude Code 配置；服务启动时未显式配置的模型保持关闭
+
+#### Scenario: 网关配置不可用
+- **WHEN** CentOS 7 的启动进程已继承 `OMP_OFFLINE=1`，有模型需要自动配置，但所需配置缺失、无法读取或无效
+- **THEN** 跳过需要该默认配置的模型并给出脱敏启动告警，不阻止全文服务启动或影响独立的显式模型配置
 
 ### Requirement: CentOS 7 后台服务管理
 
@@ -137,7 +155,7 @@ CentOS 7 的服务数据根 MUST 固定为 `/dev/shm/rust-knowledge-server`（tm
 
 ### Requirement: 可选 Rerank 精排与基础排名回退
 
-服务 MUST 支持独立配置的 Rerank API，默认关闭。精排 MUST 只在普通搜索的全文或混合基础排名之后运行，只调整本次有效范围内的有限候选顺序，不改变结果集合、原文、来源或命中类别。Web 和 MCP MUST 如实标明本次是否实际采用精排，不提供逐次查询的精排控制参数。
+服务 MUST 支持独立配置的 Rerank API；除 CentOS 7 自动配置生效时外，未显式配置默认关闭。精排 MUST 只在普通搜索的全文或混合基础排名之后运行，只调整本次有效范围内的有限候选顺序，不改变结果集合、原文、来源或命中类别。Web 和 MCP MUST 如实标明本次是否实际采用精排，不提供逐次查询的精排控制参数。
 
 #### Scenario: 有效精排只调整同类候选顺序
 - **WHEN** 已配置的 Rerank API 为有限候选返回完整有效的评分，基础排名来自全文或混合检索
@@ -154,6 +172,8 @@ CentOS 7 的服务数据根 MUST 固定为 `/dev/shm/rust-knowledge-server`（tm
 ### Requirement: 限定部署访问和资料共享范围
 
 由于工号不验证身份、Web 活动记录无需登记且 MCP 不要求登录，部署 MUST 将 Web 和 MCP 限定在运维明确批准的网络访问范围内，并且只导入获准向该范围共享的资料。所有能访问 Web 的访客均可见自报工号和知识库操作记录，部署 MUST 确认该范围获准共享这些记录；不另设应用内查看权限。
+
+自动启用模型的部署还 MUST 确认可将检索查询和导入或候选文档片段发送至配置的网关；Web 和 MCP 的共享许可不替代该授权。
 
 #### Scenario: 默认地址和远程访问
 - **WHEN** 服务以默认设置启动，或明确通过 `--listen` 绑定回环地址
