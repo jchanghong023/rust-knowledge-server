@@ -32,6 +32,7 @@ impl Fixture {
             audit,
             None,
             None,
+            FusionMode::Grouped,
             ORIGIN.into(),
             TaskTracker::new(),
         );

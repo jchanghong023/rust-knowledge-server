@@ -97,14 +97,26 @@ fn paths(reply: &SearchReply) -> Vec<&str> {
 async fn real_index_preserves_technical_evidence_and_distinguishes_empty_states() {
     let fixture = Fixture::new();
     let catalog = &fixture.catalog;
-    let empty = search(catalog, request("C++", Some("docs"), None), None, None)
-        .await
-        .unwrap();
+    let empty = search(
+        catalog,
+        request("C++", Some("docs"), None),
+        None,
+        None,
+        FusionMode::Grouped,
+    )
+    .await
+    .unwrap();
     assert_eq!(empty.status, Status::NoPublishedIndex);
     assert_eq!(
-        search(catalog, request("C++", Some("missing"), None), None, None)
-            .await
-            .unwrap_err(),
+        search(
+            catalog,
+            request("C++", Some("missing"), None),
+            None,
+            None,
+            FusionMode::Grouped
+        )
+        .await
+        .unwrap_err(),
         SearchError::LibraryNotFound
     );
     for invalid in [
@@ -112,7 +124,7 @@ async fn real_index_preserves_technical_evidence_and_distinguishes_empty_states(
         request("C++", None, Some("../guide")),
     ] {
         assert!(matches!(
-            search(catalog, invalid, None, None).await,
+            search(catalog, invalid, None, None, FusionMode::Grouped).await,
             Err(SearchError::InvalidInput(_))
         ));
     }
@@ -141,9 +153,15 @@ async fn real_index_preserves_technical_evidence_and_distinguishes_empty_states(
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     for query in ["`c++`", "std::VECTOR"] {
-        let reply = search(catalog, request(query, None, Some("guide")), None, None)
-            .await
-            .unwrap();
+        let reply = search(
+            catalog,
+            request(query, None, Some("guide")),
+            None,
+            None,
+            FusionMode::Grouped,
+        )
+        .await
+        .unwrap();
         assert_eq!(reply.status, Status::Ok);
         assert_eq!(reply.retrieval, Retrieval::Keyword);
         assert!(!reply.reranked);
@@ -182,6 +200,7 @@ async fn real_index_preserves_technical_evidence_and_distinguishes_empty_states(
             request(query, Some("docs"), Some(path)),
             None,
             None,
+            FusionMode::Grouped,
         )
         .await
         .unwrap();
@@ -192,11 +211,50 @@ async fn real_index_preserves_technical_evidence_and_distinguishes_empty_states(
         request("C++", None, Some("guide/v3/ref.md")),
         None,
         None,
+        FusionMode::Grouped,
     )
     .await
     .unwrap();
     assert_eq!(missing_path.status, Status::Ok);
     assert!(missing_path.matches.is_empty());
+}
+
+#[tokio::test]
+async fn grouped_recall_keeps_answer_evidence_from_other_files() {
+    let fixture = Fixture::new();
+    let repeated = (0..BRANCH_LIMIT + 12)
+        .map(|n| format!("## Entry {n}\n\nVXR7310 quartz calibration.\n\n"))
+        .collect::<String>();
+    let answer = "VXR7310 quartz calibration: connect the frequency counter, wait for temperature stabilization, then adjust the oscillator to the reference frequency.";
+    fixture
+        .publish(
+            "docs",
+            &[("01-reference.md", &repeated), ("02-procedure.md", answer)],
+            None,
+        )
+        .await;
+
+    for (query, category) in [
+        ("VXR7310", Category::Exact),
+        ("quartz calibration", Category::Related),
+    ] {
+        let reply = search(
+            &fixture.catalog,
+            request(query, Some("docs"), None),
+            None,
+            None,
+            FusionMode::Grouped,
+        )
+        .await
+        .unwrap();
+        assert!(
+            reply.matches.iter().take(5).any(|hit| {
+                hit.path == "02-procedure.md" && hit.text == answer && hit.category == category
+            }),
+            "{query}: repeated entries buried the procedure: {:?}",
+            paths(&reply)
+        );
+    }
 }
 
 #[tokio::test]
@@ -208,7 +266,9 @@ async fn scoped_bm25_rank_is_unaffected_by_outside_document_frequency_and_budget
     ];
     fixture.publish("docs", &in_scope, None).await;
     let query = || request("amber zircon", Some("docs"), Some("inside"));
-    let before = search(&fixture.catalog, query(), None, None).await.unwrap();
+    let before = search(&fixture.catalog, query(), None, None, FusionMode::Grouped)
+        .await
+        .unwrap();
     assert_eq!(paths(&before), ["inside/z.md", "inside/a.md"]);
 
     let outside = (0..BRANCH_LIMIT + 4)
@@ -220,7 +280,9 @@ async fn scoped_bm25_rank_is_unaffected_by_outside_document_frequency_and_budget
         .chain(in_scope)
         .collect::<Vec<_>>();
     fixture.publish("docs", &extended, None).await;
-    let after = search(&fixture.catalog, query(), None, None).await.unwrap();
+    let after = search(&fixture.catalog, query(), None, None, FusionMode::Grouped)
+        .await
+        .unwrap();
     assert_eq!(after.matches, before.matches);
 }
 
@@ -352,16 +414,24 @@ async fn hybrid_uses_eligible_pinned_versions_and_scoped_dense_recall() {
         .await;
 
     let query = || request(SEMANTIC_QUERY, None, Some("inside"));
-    let keyword = search(&fixture.catalog, query(), None, None).await.unwrap();
+    let keyword = search(&fixture.catalog, query(), None, None, FusionMode::Grouped)
+        .await
+        .unwrap();
     assert_eq!(
         server.state.embed_queries.load(Relaxed),
         1,
         "only the literal document used this input during import"
     );
     assert!(!paths(&keyword).contains(&"inside/a.md"));
-    let hybrid = search(&fixture.catalog, query(), Some(Arc::clone(&provider)), None)
-        .await
-        .unwrap();
+    let hybrid = search(
+        &fixture.catalog,
+        query(),
+        Some(Arc::clone(&provider)),
+        None,
+        FusionMode::Grouped,
+    )
+    .await
+    .unwrap();
     assert_eq!(hybrid.retrieval, Retrieval::Hybrid);
     let mut found = paths(&hybrid);
     found.sort_unstable();
@@ -374,12 +444,31 @@ async fn hybrid_uses_eligible_pinned_versions_and_scoped_dense_recall() {
             "inside/plain.md"
         ]
     );
+    let native = search(
+        &fixture.catalog,
+        query(),
+        Some(Arc::clone(&provider)),
+        None,
+        FusionMode::Edge,
+    )
+    .await
+    .unwrap();
+    assert_eq!(native.retrieval, Retrieval::Hybrid);
+    let mut native_paths = paths(&native);
+    native_paths.sort_unstable();
+    assert_eq!(native_paths, found);
 
     let mismatched = Arc::new(Embedding::new(server.config("different model"), 2).unwrap());
     let before = server.state.embed_queries.load(Relaxed);
-    let unqualified = search(&fixture.catalog, query(), Some(mismatched), None)
-        .await
-        .unwrap();
+    let unqualified = search(
+        &fixture.catalog,
+        query(),
+        Some(mismatched),
+        None,
+        FusionMode::Grouped,
+    )
+    .await
+    .unwrap();
     assert_eq!(unqualified.retrieval, Retrieval::Keyword);
     assert_eq!(unqualified.matches, keyword.matches);
     assert_eq!(server.state.embed_queries.load(Relaxed), before);
@@ -388,6 +477,7 @@ async fn hybrid_uses_eligible_pinned_versions_and_scoped_dense_recall() {
         request(SEMANTIC_QUERY, None, Some("unmatched")),
         Some(Arc::clone(&provider)),
         None,
+        FusionMode::Grouped,
     )
     .await
     .unwrap();
@@ -398,9 +488,15 @@ async fn hybrid_uses_eligible_pinned_versions_and_scoped_dense_recall() {
     let catalog = Arc::clone(&fixture.catalog);
     let search_provider = Arc::clone(&provider);
     let mut running = tokio::spawn(async move {
-        search(&catalog, query(), Some(search_provider), None)
-            .await
-            .unwrap()
+        search(
+            &catalog,
+            query(),
+            Some(search_provider),
+            None,
+            FusionMode::Grouped,
+        )
+        .await
+        .unwrap()
     });
     tokio::select! {
         () = server.state.submitted.notified() => {},
@@ -413,9 +509,15 @@ async fn hybrid_uses_eligible_pinned_versions_and_scoped_dense_recall() {
     let pinned = running.await.unwrap();
     assert_eq!(pinned.matches, hybrid.matches);
     let calls = server.state.embed_queries.load(Relaxed);
-    let next = search(&fixture.catalog, query(), Some(provider), None)
-        .await
-        .unwrap();
+    let next = search(
+        &fixture.catalog,
+        query(),
+        Some(provider),
+        None,
+        FusionMode::Grouped,
+    )
+    .await
+    .unwrap();
     assert_eq!(next.retrieval, Retrieval::Keyword);
     assert!(paths(&next).contains(&"inside/new.md"));
     assert!(!paths(&next).contains(&"inside/a.md"));
@@ -445,10 +547,18 @@ async fn rerank_reorders_only_its_window_and_survives_embedding_degradation() {
         .await;
     let query = || request("C++", Some("docs"), None);
 
-    let keyword = search(&fixture.catalog, query(), None, None).await.unwrap();
-    let keyword_ranked = search(&fixture.catalog, query(), None, Some(&rerank))
+    let keyword = search(&fixture.catalog, query(), None, None, FusionMode::Grouped)
         .await
         .unwrap();
+    let keyword_ranked = search(
+        &fixture.catalog,
+        query(),
+        None,
+        Some(&rerank),
+        FusionMode::Grouped,
+    )
+    .await
+    .unwrap();
     assert!(keyword_ranked.reranked);
     assert_eq!(keyword_ranked.retrieval, Retrieval::Keyword);
     assert_eq!(keyword.matches[0].category, Category::Exact);
@@ -478,6 +588,7 @@ async fn rerank_reorders_only_its_window_and_survives_embedding_degradation() {
         scoped_query(),
         Some(Arc::clone(&provider)),
         None,
+        FusionMode::Grouped,
     )
     .await
     .unwrap();
@@ -486,6 +597,7 @@ async fn rerank_reorders_only_its_window_and_survives_embedding_degradation() {
         scoped_query(),
         Some(Arc::clone(&provider)),
         Some(&rerank),
+        FusionMode::Grouped,
     )
     .await
     .unwrap();
@@ -524,9 +636,15 @@ async fn rerank_reorders_only_its_window_and_survives_embedding_degradation() {
 
     for mode in [1, 2, 3] {
         server.state.rerank_mode.store(mode, Relaxed);
-        let reply = search(&fixture.catalog, query(), None, Some(&rerank))
-            .await
-            .unwrap();
+        let reply = search(
+            &fixture.catalog,
+            query(),
+            None,
+            Some(&rerank),
+            FusionMode::Grouped,
+        )
+        .await
+        .unwrap();
         assert_eq!(reply.reranked, mode == 3);
         assert_eq!(reply.matches, keyword.matches);
     }
@@ -538,6 +656,7 @@ async fn rerank_reorders_only_its_window_and_survives_embedding_degradation() {
             query(),
             Some(Arc::clone(&provider)),
             Some(&rerank),
+            FusionMode::Grouped,
         )
         .await
         .unwrap();
@@ -551,6 +670,7 @@ async fn rerank_reorders_only_its_window_and_survives_embedding_degradation() {
         request("absent", Some("docs"), Some("missing")),
         None,
         Some(&rerank),
+        FusionMode::Grouped,
     )
     .await
     .unwrap();

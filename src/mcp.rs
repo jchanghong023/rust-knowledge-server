@@ -25,13 +25,16 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     catalog::Catalog,
     model_http::{Embedding, Rerank},
-    search::{self, Category, Retrieval, SearchError, SearchReply, SearchRequest, Status},
+    search::{
+        self, Category, FusionMode, Retrieval, SearchError, SearchReply, SearchRequest, Status,
+    },
 };
 
 pub(crate) fn router(
     catalog: Arc<Catalog>,
     embedding: Option<Arc<Embedding>>,
     rerank: Option<Arc<Rerank>>,
+    fusion: FusionMode,
     allowed_hosts: Vec<String>,
     mut allowed_origins: Vec<String>,
     cancellation_token: CancellationToken,
@@ -63,6 +66,7 @@ pub(crate) fn router(
         catalog,
         embedding,
         rerank,
+        fusion,
     };
     let service = StreamableHttpService::new(
         move || Ok(server.clone()),
@@ -124,6 +128,7 @@ struct KnowledgeServer {
     catalog: Arc<Catalog>,
     embedding: Option<Arc<Embedding>>,
     rerank: Option<Arc<Rerank>>,
+    fusion: FusionMode,
 }
 
 #[tool_router]
@@ -151,6 +156,7 @@ impl KnowledgeServer {
                 SearchRequest { query, library, path },
                 self.embedding.clone(),
                 self.rerank.as_deref(),
+                self.fusion,
             ) => reply,
         };
         match reply {

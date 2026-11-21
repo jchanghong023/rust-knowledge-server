@@ -7,7 +7,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use super::router;
-use crate::{catalog::Catalog, data_root::Root};
+use crate::{catalog::Catalog, data_root::Root, search::FusionMode};
 
 const INITIALIZE: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}"#;
 
@@ -42,6 +42,7 @@ async fn exact_mcp_route_and_unambiguous_origin_and_host() {
         catalog,
         None,
         None,
+        FusionMode::Grouped,
         vec!["knowledge.internal".into()],
         vec!["https://client.internal".into()],
         cancellation.clone(),

@@ -8,9 +8,10 @@ use std::{
 };
 
 use qdrant_edge::{
-    Condition, FieldCondition, Filter, IdfCorpusParams, IdfParams, Match, NamedQuery, Payload,
-    PointId, QueryEnum, QueryRequest, RetrieveRequest, ScoringQuery, ScrollRequest, SearchParams,
-    ValueVariants, VectorInternal, WithPayloadInterface,
+    Condition, EdgeShardRead, FieldCondition, Filter, Fusion, GroupRequest, IdfCorpusParams,
+    IdfParams, JsonPath, Match, NamedQuery, Payload, PointId, Prefetch, QueryEnum, QueryRequest,
+    RetrieveRequest, ScoringQuery, ScrollRequest, SearchParams, ValueVariants, VectorInternal,
+    WithPayloadInterface,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -27,9 +28,26 @@ use crate::{
 
 const MAX_QUERY_BYTES: usize = 4096;
 const BRANCH_LIMIT: usize = 32;
+const PASSAGES_PER_FILE_PER_BRANCH: usize = 2;
 const RESULT_LIMIT: usize = 16;
 const RERANK_LIMIT: usize = 8;
 const RRF_K: usize = 60;
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum FusionMode {
+    #[default]
+    Grouped,
+    Edge,
+}
+
+impl FusionMode {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Grouped => "grouped",
+            Self::Edge => "edge",
+        }
+    }
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -110,6 +128,7 @@ pub(crate) async fn search(
     request: SearchRequest,
     embedding: Option<Arc<Embedding>>,
     rerank: Option<&Rerank>,
+    fusion: FusionMode,
 ) -> Result<SearchReply, SearchError> {
     let SearchRequest {
         query,
@@ -198,7 +217,7 @@ pub(crate) async fn search(
     // The runtime bounds its blocking pool. Keep each batch of Edge work together
     // rather than scheduling a worker per library or per retrieval branch.
     let (query, mut matches) = tokio::task::spawn_blocking(move || {
-        let matches = retrieve(&snapshot, &query, filter, semantic)?;
+        let matches = retrieve(&snapshot, &query, filter, semantic, fusion)?;
         Ok::<_, SearchError>((query, matches))
     })
     .await
@@ -331,6 +350,7 @@ fn retrieve(
     query: &str,
     filter: Option<Filter>,
     semantic: Option<(Vec<usize>, Vec<f32>)>,
+    fusion: FusionMode,
 ) -> Result<Vec<Evidence>, SearchError> {
     let name = query_name(query);
     let exact_filter = name
@@ -378,20 +398,31 @@ fn retrieve(
             .collect::<Result<_, _>>()
             .map_err(|_| SearchError::Store)?,
     );
+    let path: JsonPath = "path".parse().expect("constant Edge payload path");
+    let grouped = |request: QueryRequest| {
+        GroupRequest::new(
+            QueryRequest {
+                with_payload: metadata.clone(),
+                ..request
+            },
+            path.clone(),
+            BRANCH_LIMIT / PASSAGES_PER_FILE_PER_BRANCH,
+            PASSAGES_PER_FILE_PER_BRANCH,
+        )
+    };
     let mut best = Vec::with_capacity(RESULT_LIMIT + BRANCH_LIMIT * 3);
     let mut local = HashMap::new();
+    let mut points = Vec::with_capacity(BRANCH_LIMIT);
     for (library, (_, version)) in snapshot.iter().enumerate() {
         let shard = version.open().map_err(|_| SearchError::Store)?;
         if let Some(exact) = &exact_filter {
-            let (points, _) = shard
-                .scroll(ScrollRequest {
+            let groups = shard
+                .query_groups(grouped(QueryRequest {
                     filter: Some(exact.clone()),
-                    limit: Some(BRANCH_LIMIT),
-                    with_payload: Some(metadata.clone()),
-                    ..ScrollRequest::new()
-                })
+                    ..QueryRequest::new(BRANCH_LIMIT)
+                }))
                 .map_err(|_| SearchError::Store)?;
-            for point in points {
+            for point in groups.into_iter().flat_map(|group| group.hits) {
                 let PointId::NumId(id) = point.id else {
                     return Err(SearchError::Store);
                 };
@@ -403,51 +434,83 @@ fn retrieve(
                 local.insert(candidate.id, candidate);
             }
         }
-        let branches = [
-            (keyword.as_ref(), idf.as_ref()),
-            (
-                dense
-                    .as_ref()
-                    .filter(|_| eligible.binary_search(&library).is_ok()),
-                None,
-            ),
-        ];
-        for (scoring, params) in branches {
-            let Some(scoring) = scoring else { continue };
-            let points = shard
-                .query(QueryRequest {
-                    query: Some(scoring.clone()),
+        let dense = dense
+            .as_ref()
+            .filter(|_| eligible.binary_search(&library).is_ok());
+        if let (FusionMode::Edge, Some(keyword), Some(dense)) = (fusion, keyword.as_ref(), dense) {
+            let groups = shard
+                .query_groups(grouped(QueryRequest {
+                    prefetches: vec![
+                        Prefetch {
+                            query: Some(keyword.clone()),
+                            params: idf.clone(),
+                            ..Prefetch::new(BRANCH_LIMIT)
+                        },
+                        Prefetch {
+                            query: Some(dense.clone()),
+                            ..Prefetch::new(BRANCH_LIMIT)
+                        },
+                    ],
+                    query: Some(ScoringQuery::Fusion(Fusion::Rrf {
+                        // Edge uses zero-based positions; our ranks start at one.
+                        k: RRF_K + 1,
+                        weights: None,
+                    })),
                     filter: filter.clone(),
-                    params: params.cloned(),
-                    with_payload: metadata.clone(),
                     ..QueryRequest::new(BRANCH_LIMIT)
-                })
+                }))
                 .map_err(|_| SearchError::Store)?;
-            // Edge returns nearest candidates by descending score. Equal scores
-            // share a rank; final ordering breaks ties with source coordinates.
-            let mut rank = 0;
-            let mut last = None;
-            for (position, point) in points.into_iter().enumerate() {
-                if !point.score.is_finite() {
-                    return Err(SearchError::Store);
-                }
-                if last != Some(point.score) {
-                    rank = position + 1;
-                    last = Some(point.score);
-                }
+            for point in groups.into_iter().flat_map(|group| group.hits) {
                 let PointId::NumId(id) = point.id else {
                     return Err(SearchError::Store);
                 };
-                let candidate = match local.entry(id) {
-                    Entry::Occupied(entry) => entry.into_mut(),
-                    Entry::Vacant(entry) => entry.insert(Candidate::from_payload(
-                        library,
-                        id,
-                        point.payload,
-                        name.as_deref(),
-                    )?),
-                };
-                candidate.rank_score += 1.0 / (RRF_K + rank) as f64;
+                if !point.score.is_finite() {
+                    return Err(SearchError::Store);
+                }
+                let mut candidate =
+                    Candidate::from_payload(library, id, point.payload, name.as_deref())?;
+                candidate.rank_score = f64::from(point.score);
+                local.insert(id, candidate);
+            }
+        } else {
+            for (scoring, params) in [(keyword.as_ref(), idf.as_ref()), (dense, None)] {
+                let Some(scoring) = scoring else { continue };
+                let groups = shard
+                    .query_groups(grouped(QueryRequest {
+                        query: Some(scoring.clone()),
+                        filter: filter.clone(),
+                        params: params.cloned(),
+                        ..QueryRequest::new(BRANCH_LIMIT)
+                    }))
+                    .map_err(|_| SearchError::Store)?;
+                points.extend(groups.into_iter().flat_map(|group| group.hits));
+                // Edge sorts groups by their best hit, not all hits globally.
+                // Restore branch-wide score order before converting scores to ranks.
+                points.sort_unstable_by(|left, right| right.score.total_cmp(&left.score));
+                let mut rank = 0;
+                let mut last = None;
+                for (position, point) in points.drain(..).enumerate() {
+                    if !point.score.is_finite() {
+                        return Err(SearchError::Store);
+                    }
+                    if last != Some(point.score) {
+                        rank = position + 1;
+                        last = Some(point.score);
+                    }
+                    let PointId::NumId(id) = point.id else {
+                        return Err(SearchError::Store);
+                    };
+                    let candidate = match local.entry(id) {
+                        Entry::Occupied(entry) => entry.into_mut(),
+                        Entry::Vacant(entry) => entry.insert(Candidate::from_payload(
+                            library,
+                            id,
+                            point.payload,
+                            name.as_deref(),
+                        )?),
+                    };
+                    candidate.rank_score += 1.0 / (RRF_K + rank) as f64;
+                }
             }
         }
         best.extend(local.drain().map(|(_, candidate)| candidate));

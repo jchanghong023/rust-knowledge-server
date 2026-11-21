@@ -34,7 +34,7 @@ use crate::{
     import::{self, Batch, ImportError},
     index,
     model_http::{Embedding, Rerank},
-    search::{self, SearchError, SearchRequest},
+    search::{self, FusionMode, SearchError, SearchRequest},
 };
 
 const COOKIE: &str = "knowledge_session";
@@ -50,6 +50,7 @@ pub(crate) fn router(
     audit: Arc<Audit>,
     embedding: Option<Arc<Embedding>>,
     rerank: Option<Arc<Rerank>>,
+    fusion: FusionMode,
     origin: String,
     jobs: TaskTracker,
 ) -> Router {
@@ -84,6 +85,7 @@ pub(crate) fn router(
             audit,
             embedding,
             rerank,
+            fusion,
             secure_cookie: origin.starts_with("https://"),
             origin,
             sessions: Mutex::new(Sessions::default()),
@@ -99,6 +101,7 @@ struct Web {
     audit: Arc<Audit>,
     embedding: Option<Arc<Embedding>>,
     rerank: Option<Arc<Rerank>>,
+    fusion: FusionMode,
     origin: String,
     secure_cookie: bool,
     sessions: Mutex<Sessions>,
@@ -581,6 +584,7 @@ async fn run_search(
                 request,
                 worker.embedding.clone(),
                 worker.rerank.as_deref(),
+                worker.fusion,
             )
             .await;
             let id = op.id;

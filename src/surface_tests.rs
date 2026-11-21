@@ -21,6 +21,7 @@ use crate::{
     index::EMBEDDING_GENERATION,
     mcp,
     model_http::{ApiConfig, Embedding, Rerank},
+    search::FusionMode,
     web,
 };
 
@@ -86,6 +87,7 @@ impl Service {
         root: &Path,
         embedding: Option<Arc<Embedding>>,
         rerank: Option<Arc<Rerank>>,
+        fusion: FusionMode,
     ) -> Self {
         let catalog = Arc::new(Catalog::open(Root::open(root).unwrap()).unwrap());
         let audit = Arc::new(Audit::open(catalog.root_path(), &catalog).unwrap());
@@ -98,6 +100,7 @@ impl Service {
             audit,
             embedding.clone(),
             rerank.clone(),
+            fusion,
             origin,
             imports.clone(),
         )
@@ -105,6 +108,7 @@ impl Service {
             catalog.clone(),
             embedding,
             rerank,
+            fusion,
             vec![MCP_HOST.to_owned()],
             Vec::new(),
             shutdown.clone(),
@@ -495,7 +499,7 @@ fn assert_fixture_evidence(reply: &Value) {
 #[tokio::test]
 async fn native_mcp_and_web_agree_on_evidence_empty_states_and_missing_segments() {
     let root = tempfile::tempdir().unwrap();
-    let service = Service::start(root.path(), None, None).await;
+    let service = Service::start(root.path(), None, None, FusionMode::Grouped).await;
     let before_mcp = service.audit_records();
     let rejected = send(
         mcp_request(&service)
@@ -608,7 +612,7 @@ async fn native_mcp_and_web_agree_on_evidence_empty_states_and_missing_segments(
     let config = index.join("edge_config.json");
     let original_config = fs::read(&config).expect("the index configuration remains on disk");
 
-    let service = Service::start(root.path(), None, None).await;
+    let service = Service::start(root.path(), None, None, FusionMode::Grouped).await;
     assert_eq!(service.audit_records(), persisted_audit);
     let mut mcp = Mcp::connect(&service).await;
     let cookie = service.login(EMPLOYEE).await;
@@ -633,7 +637,7 @@ async fn native_mcp_and_web_agree_on_evidence_empty_states_and_missing_segments(
 #[tokio::test]
 async fn web_denies_untrusted_writes_and_bad_batches_preserve_the_published_version() {
     let root = tempfile::tempdir().unwrap();
-    let service = Service::start(root.path(), None, None).await;
+    let service = Service::start(root.path(), None, None, FusionMode::Grouped).await;
     let empty_audit = service.audit_records();
     for employee in ["1234567", "0000123８", " 0001234"] {
         let response = send(
@@ -856,7 +860,7 @@ async fn equivalent_requests_report_their_own_rerank_success_or_degradation() {
         })
         .unwrap(),
     );
-    let service = Service::start(root.path(), None, Some(rerank)).await;
+    let service = Service::start(root.path(), None, Some(rerank), FusionMode::Grouped).await;
     let cookie = service.login(EMPLOYEE).await;
     service.create(&cookie).await;
     service.publish_fixture(&cookie).await;
@@ -918,7 +922,8 @@ async fn web_and_mcp_report_embedding_fallback_and_reopen_without_optional_metad
         )
         .unwrap(),
     );
-    let service = Service::start(root.path(), Some(embedding.clone()), None).await;
+    let service =
+        Service::start(root.path(), Some(embedding.clone()), None, FusionMode::Edge).await;
     let cookie = service.login(EMPLOYEE).await;
     service.create(&cookie).await;
     service.publish_fixture(&cookie).await;
@@ -943,7 +948,8 @@ async fn web_and_mcp_report_embedding_fallback_and_reopen_without_optional_metad
         if missing {
             fs::remove_file(&metadata).unwrap();
         }
-        let service = Service::start(root.path(), Some(embedding.clone()), None).await;
+        let service =
+            Service::start(root.path(), Some(embedding.clone()), None, FusionMode::Edge).await;
         let cookie = service.login(EMPLOYEE).await;
         let mut mcp = Mcp::connect(&service).await;
         assert_eq!(
