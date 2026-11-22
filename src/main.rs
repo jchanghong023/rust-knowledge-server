@@ -1,5 +1,6 @@
 mod audit;
 mod catalog;
+mod collab;
 #[cfg(target_os = "linux")]
 mod daemon;
 mod data_root;
@@ -136,6 +137,7 @@ async fn serve(settings: Settings, mode: RunMode) -> Result<(), Box<dyn Error>> 
     let jobs = TaskTracker::new();
     let cancellation = CancellationToken::new();
     let app = Router::new()
+        .merge(collab::router(jobs.clone(), cancellation.clone()))
         .route("/", get(index))
         .route("/app.css", get(stylesheet))
         .route("/app.js", get(script))

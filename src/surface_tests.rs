@@ -11,7 +11,12 @@ use axum::{Json, Router, extract::State, response::IntoResponse, routing::post};
 use reqwest::{Client, Method, RequestBuilder, Response, StatusCode, header};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::{net::TcpListener, task::JoinHandle, time};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+    task::JoinHandle,
+    time,
+};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use crate::{
@@ -520,6 +525,83 @@ fn assert_mcp_fixture(reply: &Value) {
             }]
         })
     );
+}
+
+#[tokio::test]
+async fn collab2_room_number_cannot_be_replaced_and_expires_on_normal_close() {
+    async fn open_host(client: &Client, origin: &str, room_id: &str) -> reqwest::Upgraded {
+        let response = send(
+            client
+                .get(format!("{origin}/r/{room_id}?role=host"))
+                .header(header::CONNECTION, "upgrade")
+                .header(header::UPGRADE, "websocket")
+                .header(header::SEC_WEBSOCKET_VERSION, "13")
+                .header(header::SEC_WEBSOCKET_KEY, "dGhlIHNhbXBsZSBub25jZQ=="),
+        )
+        .await;
+        assert_status(&response, StatusCode::SWITCHING_PROTOCOLS);
+        let mut socket = response.upgrade().await.unwrap();
+        let mut ready = [0; 20];
+        time::timeout(DEADLINE, socket.read_exact(&mut ready))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&ready, b"\x81\x12{\"t\":\"host-ready\"}");
+        socket
+    }
+
+    let jobs = TaskTracker::new();
+    let shutdown = CancellationToken::new();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let app = crate::collab::router(jobs.clone(), shutdown.clone());
+    let server = Loopback::spawn(listener, http_access(app), shutdown);
+    let client = Client::builder()
+        .http1_only()
+        .no_proxy()
+        .timeout(DEADLINE)
+        .build()
+        .unwrap();
+    let room_number = "001Review";
+    let room_id = "FirstHost01";
+    let other_room_id = "SecondHost02";
+    let mut host = open_host(&client, &server.origin, room_id).await;
+    let other_host = open_host(&client, &server.origin, other_room_id).await;
+    let register = |room_id, secret| {
+        client
+            .post(format!("{}/api/collab2/rooms", server.origin))
+            .json(&json!({"roomNumber": room_number, "roomId": room_id, "secret": secret}))
+    };
+    let lookup = || {
+        client
+            .post(format!("{}/api/collab2/lookup", server.origin))
+            .json(&json!({"roomNumber": room_number}))
+    };
+    let secret = "A".repeat(64);
+    let response = send(register(room_id, secret.clone())).await;
+    assert_status(&response, StatusCode::CREATED);
+    let response = send(register(other_room_id, "B".repeat(64))).await;
+    assert_status(&response, StatusCode::CONFLICT);
+    assert_eq!(
+        body(send(lookup()).await, StatusCode::OK).await,
+        json!({"roomId": room_id, "secret": secret})
+    );
+
+    // Client Close(1000), masked with [1, 2, 3, 4]; server reply is unmasked.
+    host.write_all(b"\x88\x82\x01\x02\x03\x04\x02\xea")
+        .await
+        .unwrap();
+    let mut reply = [0; 4];
+    time::timeout(DEADLINE, host.read_exact(&mut reply))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&reply, b"\x88\x02\x03\xe8");
+    assert_status(&send(lookup()).await, StatusCode::NOT_FOUND);
+
+    drop((host, other_host));
+    server.stop().await;
+    jobs.close();
+    time::timeout(DEADLINE, jobs.wait()).await.unwrap();
 }
 
 #[tokio::test]

@@ -65,3 +65,15 @@ claude mcp add --transport http knowledge http://127.0.0.1:9333/mcp
 远程部署时，两个命令中的地址都换成服务的实际 `/mcp` 地址。
 
 [技术方案](openspec/changes/add-standalone-knowledge-server/design.md) · [部署与验收](openspec/changes/add-standalone-knowledge-server/tasks.md#4-部署验收) · [MCP 接口](openspec/changes/add-standalone-knowledge-server/specs/knowledge-mcp/spec.md)
+
+## OMP 多人协作：`/collab2`
+
+需使用支持 `/collab2` 的 OMP 版本。在 Windows 或 CentOS 7 的 OMP 终端中：
+
+1. A 输入 `/collab2 xxx`，用房间号 `xxx` 分享当前会话。
+2. B、C 各自输入 `/collab2 join xxx`。不用工号，三人都能向 A 的 Agent 发消息。
+3. A 输入 `/collab2 stop` 或切换会话后，旧房间不能再加入。
+
+同机无需配置，OMP 默认连接 `127.0.0.1:9333`。跨机时，三人在启动 OMP 前都将 `OMP_COLLAB2_IP` 设为知识库的同一个内网 IP，端口仍是 `9333`。
+
+知识库 Web、MCP 和房间查询用 HTTP，协作用 WS，无需 HTTPS 或证书。只在可信隔离内网使用，并只把房间号分享给信任的同事。
